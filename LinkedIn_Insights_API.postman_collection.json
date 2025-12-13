@@ -1,0 +1,384 @@
+{
+	"info": {
+		"_postman_id": "linkedin-insights-api",
+		"name": "LinkedIn Insights API",
+		"description": "Postman collection for LinkedIn Insights Microservice API",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "Health Check",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{base_url}}/api/v1/health",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"api",
+						"v1",
+						"health"
+					]
+				},
+				"description": "Check service health status"
+			},
+			"response": []
+		},
+		{
+			"name": "Get Page Details",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{base_url}}/api/v1/pages/{{page_id}}?force_refresh=false",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"api",
+						"v1",
+						"pages",
+						"{{page_id}}"
+					],
+					"query": [
+						{
+							"key": "force_refresh",
+							"value": "false",
+							"description": "Force refresh by scraping again"
+						}
+					]
+				},
+				"description": "Get details of a LinkedIn page by Page ID. If page doesn't exist in DB, it will be scraped automatically."
+			},
+			"response": []
+		},
+		{
+			"name": "Get Page Details (Force Refresh)",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{base_url}}/api/v1/pages/{{page_id}}?force_refresh=true",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"api",
+						"v1",
+						"pages",
+						"{{page_id}}"
+					],
+					"query": [
+						{
+							"key": "force_refresh",
+							"value": "true",
+							"description": "Force refresh by scraping again"
+						}
+					]
+				},
+				"description": "Force refresh page data by re-scraping"
+			},
+			"response": []
+		},
+		{
+			"name": "Search Pages - All",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{base_url}}/api/v1/pages?page=1&page_size=10",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"api",
+						"v1",
+						"pages"
+					],
+					"query": [
+						{
+							"key": "page",
+							"value": "1",
+							"description": "Page number"
+						},
+						{
+							"key": "page_size",
+							"value": "10",
+							"description": "Items per page"
+						}
+					]
+				},
+				"description": "Get all pages with pagination"
+			},
+			"response": []
+		},
+		{
+			"name": "Search Pages - By Follower Range",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{base_url}}/api/v1/pages?follower_min=20000&follower_max=40000&page=1&page_size=10",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"api",
+						"v1",
+						"pages"
+					],
+					"query": [
+						{
+							"key": "follower_min",
+							"value": "20000",
+							"description": "Minimum follower count"
+						},
+						{
+							"key": "follower_max",
+							"value": "40000",
+							"description": "Maximum follower count"
+						},
+						{
+							"key": "page",
+							"value": "1",
+							"description": "Page number"
+						},
+						{
+							"key": "page_size",
+							"value": "10",
+							"description": "Items per page"
+						}
+					]
+				},
+				"description": "Search pages by follower count range (e.g., 20k-40k followers)"
+			},
+			"response": []
+		},
+		{
+			"name": "Search Pages - By Name",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{base_url}}/api/v1/pages?name_search=deep&page=1&page_size=10",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"api",
+						"v1",
+						"pages"
+					],
+					"query": [
+						{
+							"key": "name_search",
+							"value": "deep",
+							"description": "Search by page name (partial match)"
+						},
+						{
+							"key": "page",
+							"value": "1",
+							"description": "Page number"
+						},
+						{
+							"key": "page_size",
+							"value": "10",
+							"description": "Items per page"
+						}
+					]
+				},
+				"description": "Search pages by name (case-insensitive partial match)"
+			},
+			"response": []
+		},
+		{
+			"name": "Search Pages - By Industry",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{base_url}}/api/v1/pages?industry=Technology&page=1&page_size=10",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"api",
+						"v1",
+						"pages"
+					],
+					"query": [
+						{
+							"key": "industry",
+							"value": "Technology",
+							"description": "Filter by industry"
+						},
+						{
+							"key": "page",
+							"value": "1",
+							"description": "Page number"
+						},
+						{
+							"key": "page_size",
+							"value": "10",
+							"description": "Items per page"
+						}
+					]
+				},
+				"description": "Filter pages by industry"
+			},
+			"response": []
+		},
+		{
+			"name": "Search Pages - Combined Filters",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{base_url}}/api/v1/pages?follower_min=1000&follower_max=50000&name_search=tech&industry=Technology&page=1&page_size=10",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"api",
+						"v1",
+						"pages"
+					],
+					"query": [
+						{
+							"key": "follower_min",
+							"value": "1000",
+							"description": "Minimum follower count"
+						},
+						{
+							"key": "follower_max",
+							"value": "50000",
+							"description": "Maximum follower count"
+						},
+						{
+							"key": "name_search",
+							"value": "tech",
+							"description": "Search by page name"
+						},
+						{
+							"key": "industry",
+							"value": "Technology",
+							"description": "Filter by industry"
+						},
+						{
+							"key": "page",
+							"value": "1",
+							"description": "Page number"
+						},
+						{
+							"key": "page_size",
+							"value": "10",
+							"description": "Items per page"
+						}
+					]
+				},
+				"description": "Search pages with multiple filters combined"
+			},
+			"response": []
+		},
+		{
+			"name": "Get Page Followers",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{base_url}}/api/v1/pages/{{page_id}}/followers?page=1&page_size=50",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"api",
+						"v1",
+						"pages",
+						"{{page_id}}",
+						"followers"
+					],
+					"query": [
+						{
+							"key": "page",
+							"value": "1",
+							"description": "Page number"
+						},
+						{
+							"key": "page_size",
+							"value": "50",
+							"description": "Items per page"
+						}
+					]
+				},
+				"description": "Get list of followers/people working at a given page"
+			},
+			"response": []
+		},
+		{
+			"name": "Get Page Posts",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{base_url}}/api/v1/pages/{{page_id}}/posts?limit=15",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"api",
+						"v1",
+						"pages",
+						"{{page_id}}",
+						"posts"
+					],
+					"query": [
+						{
+							"key": "limit",
+							"value": "15",
+							"description": "Number of posts to retrieve (max 25)"
+						}
+					]
+				},
+				"description": "Get recent posts of a page (10-15 posts, includes comments)"
+			},
+			"response": []
+		},
+		{
+			"name": "Refresh Page Data",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"url": {
+					"raw": "{{base_url}}/api/v1/pages/{{page_id}}/refresh",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"api",
+						"v1",
+						"pages",
+						"{{page_id}}",
+						"refresh"
+					]
+				},
+				"description": "Force refresh page data by re-scraping from LinkedIn"
+			},
+			"response": []
+		}
+	],
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "http://localhost:8000",
+			"type": "string"
+		},
+		{
+			"key": "page_id",
+			"value": "deepsolv",
+			"type": "string"
+		}
+	]
+}
+
