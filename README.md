@@ -281,10 +281,6 @@ Import `LinkedIn_Insights_API.postman_collection.json` to test all endpoints.
 - Check logs: `docker-compose logs app`
 - Verify environment variables are set correctly
 
-## License
-
-This project is part of a GenAI Developer Intern assignment.
-
 ---
 
 **Status**: ✅ Production Ready
