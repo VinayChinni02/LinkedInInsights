@@ -56,7 +56,6 @@ class Page(BaseModel):
     industry: Optional[str] = Field(None, description="Page industry")
     total_followers: Optional[int] = Field(None, description="Total number of followers")
     head_count: Optional[str] = Field(None, description="Company head count")
-    specialities: Optional[List[str]] = Field(default_factory=list, description="List of specialities")
     location: Optional[str] = Field(None, description="Company location")
     founded: Optional[str] = Field(None, description="Year founded")
     company_type: Optional[str] = Field(None, description="Type of company")
@@ -79,10 +78,12 @@ class Page(BaseModel):
                 "industry": "Technology",
                 "total_followers": 5000,
                 "head_count": "11-50",
-                "specialities": ["AI", "Machine Learning"],
                 "location": "San Francisco, CA",
                 "founded": "2020"
             }
         }
     }
+
+
+
 

@@ -4,7 +4,7 @@ LinkedIn scraper service using Selenium/Playwright.
 import asyncio
 import re
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, Browser, Page as PlaywrightPage
 from config import settings
@@ -578,13 +578,41 @@ class LinkedInScraperService:
                 "Upgrade-Insecure-Requests": "1",
             })
             
-            # Try to access the page
-            await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
-            await page.wait_for_timeout(3000)
+            # Try to access the page and check response
+            try:
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
+                
+                # Check HTTP status code
+                if response and response.status == 404:
+                    print(f"[WARNING] Page {page_id} returned HTTP 404 - page does not exist on LinkedIn")
+                    await page.close()
+                    return None
+                
+                await page.wait_for_timeout(3000)
+            except Exception as nav_error:
+                print(f"[ERROR] Navigation error for {page_id}: {type(nav_error).__name__}: {str(nav_error)}")
+                await page.close()
+                return None
             
             # Check if we're redirected to login or join page
             current_url = page.url
             page_title = await page.title()
+            page_content = await page.content()
+            
+            # Check if page doesn't exist (404) - multiple checks
+            page_not_found_indicators = [
+                "404" in page_title,
+                "page not found" in page_content.lower(),
+                "doesn't exist" in page_content.lower(),
+                "couldn't find" in page_content.lower(),
+                "not available" in page_content.lower() and "company" in page_content.lower(),
+                current_url.endswith("/404") or "/404" in current_url,
+            ]
+            
+            if any(page_not_found_indicators):
+                print(f"[WARNING] Page {page_id} does not exist on LinkedIn (404 detected via content/URL)")
+                await page.close()
+                return None
             
             # Detect if we hit a login/join page
             if ("login" in current_url.lower() or 
@@ -640,6 +668,34 @@ class LinkedInScraperService:
             content = await page.content()
             soup = BeautifulSoup(content, 'html.parser')
             
+            # Also try to navigate to About section for more detailed data
+            about_soup = None
+            try:
+                about_url = f"https://www.linkedin.com/company/{page_id}/about/"
+                print(f"[INFO] Attempting to access About section for more detailed data...")
+                about_page = await self.context.new_page() if self.context else await self.browser.new_page()
+                
+                try:
+                    await about_page.goto(about_url, wait_until="domcontentloaded", timeout=30000)
+                    await about_page.wait_for_timeout(3000)
+                    
+                    # Scroll to load About section content
+                    await about_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await about_page.wait_for_timeout(2000)
+                    await about_page.evaluate("window.scrollTo(0, 0)")
+                    await about_page.wait_for_timeout(1000)
+                    
+                    about_content = await about_page.content()
+                    about_soup = BeautifulSoup(about_content, 'html.parser')
+                    print(f"[INFO] Successfully loaded About section")
+                except Exception as about_error:
+                    print(f"[DEBUG] Could not access About section: {about_error}")
+                finally:
+                    await about_page.close()
+            except Exception as e:
+                print(f"[DEBUG] Error trying to access About section: {e}")
+                about_soup = None
+            
             # Also try to get data from network responses
             network_data = {}
             try:
@@ -682,6 +738,39 @@ class LinkedInScraperService:
                 extracted_description = re.sub(r'\s*\|\s*$', '', extracted_description).strip()
                 extracted_description = re.sub(r'^\|\s*', '', extracted_description).strip()
             
+            # Extract industry (try About section first, then main page)
+            extracted_industry = None
+            if about_soup:
+                about_content = str(about_soup)
+                extracted_industry = self._extract_industry(about_soup, about_content, description=extracted_description)
+            
+            if not extracted_industry:
+                extracted_industry = (self._extract_industry(soup, content, description=extracted_description) or 
+                                    page_data_from_js.get("industry") or 
+                                    network_data.get("industry"))
+            
+            # Extract head_count (try About section first)
+            extracted_head_count = None
+            if about_soup:
+                about_content = str(about_soup)
+                extracted_head_count = self._extract_head_count(about_soup, about_content)
+            
+            if not extracted_head_count:
+                extracted_head_count = (self._extract_head_count(soup, content) or 
+                                       page_data_from_js.get("head_count") or 
+                                       network_data.get("head_count"))
+            
+            # Extract other fields from About section if available
+            extracted_website = None
+            extracted_location = None
+            extracted_founded = None
+            
+            if about_soup:
+                about_content = str(about_soup)
+                extracted_website = self._extract_website(about_soup) or extracted_website
+                extracted_location = self._extract_location(about_soup, about_content) or extracted_location
+                extracted_founded = self._extract_founded(about_soup, about_content) or extracted_founded
+            
             page_data = {
                 "page_id": page_id,
                 "name": extracted_name or page_id.title(),  # Fallback to capitalized page_id
@@ -689,19 +778,18 @@ class LinkedInScraperService:
                 "linkedin_id": self._extract_linkedin_id(soup, content) or page_data_from_js.get("linkedin_id") or network_data.get("linkedin_id"),
                 "profile_picture": self._extract_profile_picture(soup) or page_data_from_js.get("profile_picture") or network_data.get("profile_picture"),
                 "description": extracted_description,
-                "website": self._extract_website(soup) or page_data_from_js.get("website") or network_data.get("website"),
-                "industry": self._extract_industry(soup, content) or page_data_from_js.get("industry") or network_data.get("industry"),
+                "website": extracted_website or self._extract_website(soup) or page_data_from_js.get("website") or network_data.get("website"),
+                "industry": extracted_industry,
                 "total_followers": extracted_followers,
-                "head_count": self._extract_head_count(soup, content) or page_data_from_js.get("head_count") or network_data.get("head_count"),
-                "specialities": self._extract_specialities(soup, content) or page_data_from_js.get("specialities", []) or network_data.get("specialities", []),
-                "location": self._extract_location(soup, content) or page_data_from_js.get("location") or network_data.get("location"),
-                "founded": self._extract_founded(soup, content) or page_data_from_js.get("founded") or network_data.get("founded"),
+                "head_count": extracted_head_count,
+                "location": extracted_location or self._extract_location(soup, content) or page_data_from_js.get("location") or network_data.get("location"),
+                "founded": extracted_founded or self._extract_founded(soup, content) or page_data_from_js.get("founded") or network_data.get("founded"),
                 "company_type": self._extract_company_type(soup, content) or page_data_from_js.get("company_type") or network_data.get("company_type"),
             }
             
             # Log what we successfully extracted
             extracted_fields = [k for k, v in page_data.items() if v and k not in ['page_id', 'url', 'scraped_at', 'updated_at']]
-            null_fields = [k for k, v in page_data.items() if not v and k not in ['page_id', 'url', 'scraped_at', 'updated_at', 'specialities', 'posts', 'people']]
+            null_fields = [k for k, v in page_data.items() if not v and k not in ['page_id', 'url', 'scraped_at', 'updated_at', 'posts', 'people']]
             print(f"[DEBUG] Scraped {page_id}: Extracted {len(extracted_fields)} fields: {', '.join(extracted_fields[:5])}")
             if null_fields:
                 print(f"[DEBUG] Null fields for {page_id}: {', '.join(null_fields)}")
@@ -916,8 +1004,18 @@ class LinkedInScraperService:
                                     
                                     // Strategy 3: Look for comment counts in spans/buttons
                                     if (!post.comments) {
-                                        const commentElements = elem.querySelectorAll('[class*="comment"], button[class*="comment"]');
+                                        const commentElements = elem.querySelectorAll('[class*="comment"], button[class*="comment"], [aria-label*="comment"]');
                                         for (const el of commentElements) {
+                                            // Check aria-label first
+                                            const ariaLabel = el.getAttribute('aria-label') || '';
+                                            if (ariaLabel && ariaLabel.includes('comment')) {
+                                                const numMatch = ariaLabel.match(/(\\d+[,\\d]*)/);
+                                                if (numMatch) {
+                                                    post.comments = parseInt(numMatch[1].replace(/,/g, ''));
+                                                    break;
+                                                }
+                                            }
+                                            // Check text content
                                             const text = el.textContent || '';
                                             const numMatch = text.match(/(\\d+[,\\d]*)/);
                                             if (numMatch && text.length < 50) {
@@ -927,7 +1025,22 @@ class LinkedInScraperService:
                                         }
                                     }
                                     
-                                    // Extract author - multiple strategies
+                                    // Strategy 4: Look for engagement in text patterns
+                                    const elemText = elem.textContent || '';
+                                    if (!post.likes) {
+                                        const likeMatch = elemText.match(/(\\d+[,\\d]*)\\s*(?:like|reaction|thumbs)/i);
+                                        if (likeMatch) {
+                                            post.likes = parseInt(likeMatch[1].replace(/,/g, ''));
+                                        }
+                                    }
+                                    if (!post.comments) {
+                                        const commentMatch = elemText.match(/(\\d+[,\\d]*)\\s*comment/i);
+                                        if (commentMatch) {
+                                            post.comments = parseInt(commentMatch[1].replace(/,/g, ''));
+                                        }
+                                    }
+                                    
+                                    // Extract author - multiple strategies with improved logic
                                     const authorSelectors = [
                                         '[class*="feed-shared-actor"] a[href*="/in/"]',
                                         '[class*="feed-shared-actor__name"]',
@@ -948,11 +1061,11 @@ class LinkedInScraperService:
                                             if (!authorText || authorText.length < 2) {
                                                 // Look for name in parent/ancestor
                                                 let parent = author.parentElement;
-                                                for (let i = 0; i < 3 && parent; i++) {
-                                                    const nameSpan = parent.querySelector('span[class*="name"], span[dir="ltr"], span[aria-hidden="true"]');
+                                                for (let i = 0; i < 5 && parent; i++) {
+                                                    const nameSpan = parent.querySelector('span[class*="name"], span[dir="ltr"], span[aria-hidden="true"], [class*="actor__name"]');
                                                     if (nameSpan && nameSpan.textContent) {
                                                         const text = nameSpan.textContent.trim();
-                                                        if (text.length > 2 && text.length < 100) {
+                                                        if (text.length > 2 && text.length < 100 && !text.match(/^\\d+$/)) {
                                                             authorText = text;
                                                             break;
                                                         }
@@ -973,7 +1086,8 @@ class LinkedInScraperService:
                                             if (authorText && authorText.length > 2 && authorText.length < 100 && 
                                                 !authorText.match(/^\\d+$/) && 
                                                 !authorText.toLowerCase().includes('followers') &&
-                                                !authorText.toLowerCase().includes('view profile')) {
+                                                !authorText.toLowerCase().includes('view profile') &&
+                                                !authorText.toLowerCase().includes('see more')) {
                                                 post.author = authorText;
                                                 post.authorUrl = author.href.split('?')[0]; // Also capture profile URL
                                                 break;
@@ -981,14 +1095,25 @@ class LinkedInScraperService:
                                         }
                                     }
                                     
-                                    // Fallback: Try to find any link with /in/ and get name from nearby text
+                                    // Fallback: Try to find any link with /in/ and get name from nearby text (MORE AGGRESSIVE)
                                     if (!post.author) {
                                         const profileLinks = elem.querySelectorAll('a[href*="/in/"]');
                                         for (const link of profileLinks) {
                                             const href = link.href || '';
-                                            if (href.includes('/in/')) {
-                                                // Look for name in the same container
-                                                let container = link.closest('[class*="actor"], [class*="author"], [class*="feed"]');
+                                            if (href.includes('/in/') && !href.includes('/company/')) {
+                                                // Strategy 1: Get text directly from link
+                                                const linkText = link.textContent?.trim() || '';
+                                                if (linkText && linkText.length > 2 && linkText.length < 100 && 
+                                                    !linkText.match(/^\\d+$/) && 
+                                                    !linkText.toLowerCase().includes('view profile') &&
+                                                    !linkText.toLowerCase().includes('linkedin')) {
+                                                    post.author = linkText;
+                                                    post.authorUrl = href.split('?')[0];
+                                                    break;
+                                                }
+                                                
+                                                // Strategy 2: Look for name in the same container
+                                                let container = link.closest('[class*="actor"], [class*="author"], [class*="feed"], [class*="update"]');
                                                 if (container) {
                                                     const allText = container.textContent || '';
                                                     // Try to extract a name-like pattern (2-4 words, starts with capital)
@@ -998,16 +1123,147 @@ class LinkedInScraperService:
                                                         post.authorUrl = href.split('?')[0];
                                                         break;
                                                     }
+                                                    
+                                                    // Strategy 3: Look for spans or divs near the link
+                                                    const siblings = Array.from(link.parentElement?.children || []);
+                                                    for (const sibling of siblings) {
+                                                        if (sibling !== link && (sibling.tagName === 'SPAN' || sibling.tagName === 'DIV')) {
+                                                            const siblingText = sibling.textContent?.trim() || '';
+                                                            const nameMatch2 = siblingText.match(/^([A-Z][a-z]+(?:\\s+[A-Z][a-z]+){1,3})/);
+                                                            if (nameMatch2 && nameMatch2[1].length > 3 && nameMatch2[1].length < 50 &&
+                                                                !nameMatch2[1].toLowerCase().includes('followers') &&
+                                                                !nameMatch2[1].toLowerCase().includes('view')) {
+                                                                post.author = nameMatch2[1];
+                                                                post.authorUrl = href.split('?')[0];
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                    if (post.author) break;
                                                 }
                                             }
                                         }
                                     }
                                     
-                                    // Extract date
-                                    const timeElem = elem.querySelector('time[datetime]');
-                                    if (timeElem) {
-                                        const datetime = timeElem.getAttribute('datetime');
-                                        if (datetime) post.created_at = datetime;
+                                    // Final fallback: Extract from the very first text node or heading in the post
+                                    if (!post.author) {
+                                        const firstHeading = elem.querySelector('h3, h2, h4, [class*="headline"], [class*="title"]');
+                                        if (firstHeading) {
+                                            const headingText = firstHeading.textContent?.trim() || '';
+                                            const nameMatch = headingText.match(/^([A-Z][a-z]+(?:\\s+[A-Z][a-z]+){1,3})/);
+                                            if (nameMatch && nameMatch[1].length > 3 && nameMatch[1].length < 50) {
+                                                post.author = nameMatch[1];
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Extract date - SUPER AGGRESSIVE with multiple strategies
+                                    // Strategy 1: Check ALL time elements with datetime
+                                    const allTimeElems = elem.querySelectorAll('time[datetime], time, [datetime]');
+                                    for (const te of allTimeElems) {
+                                        const dt = te.getAttribute('datetime') || te.getAttribute('data-time');
+                                        if (dt) {
+                                            post.created_at = dt;
+                                            break;
+                                        }
+                                    }
+                                    
+                                    // Strategy 2: Check aria-label for dates
+                                    if (!post.created_at) {
+                                        const timeElements = elem.querySelectorAll('time, [class*="time"], [class*="date"], [class*="timestamp"]');
+                                        for (const te of timeElements) {
+                                            const ariaLabel = te.getAttribute('aria-label') || '';
+                                            const isoMatch = ariaLabel.match(/(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})?)/);
+                                            if (isoMatch) {
+                                                post.created_at = isoMatch[1];
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Strategy 3: Try to find date in text (e.g., "2d ago", "1 week ago") - expanded patterns
+                                    if (!post.created_at) {
+                                        const dateText = elem.textContent || '';
+                                        
+                                        // Try ISO format first
+                                        const isoMatch = dateText.match(/(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})?)/);
+                                        if (isoMatch) {
+                                            post.created_at = isoMatch[1];
+                                        } else {
+                                            // Try relative time patterns
+                                            const datePatterns = [
+                                                [/(\\d+)\\s*(?:min|minute)s?\\s*ago/i, (m, v) => { const d = new Date(); d.setMinutes(d.getMinutes() - v); return d; }],
+                                                [/(\\d+)\\s*(?:hour|hr)s?\\s*ago/i, (m, v) => { const d = new Date(); d.setHours(d.getHours() - v); return d; }],
+                                                [/(\\d+)\\s*(?:day|d)s?\\s*ago/i, (m, v) => { const d = new Date(); d.setDate(d.getDate() - v); return d; }],
+                                                [/(\\d+)\\s*(?:week|w)s?\\s*ago/i, (m, v) => { const d = new Date(); d.setDate(d.getDate() - (v * 7)); return d; }],
+                                                [/(\\d+)\\s*(?:month|mo)s?\\s*ago/i, (m, v) => { const d = new Date(); d.setMonth(d.getMonth() - v); return d; }],
+                                                [/(\\d+)\\s*(?:year|yr)s?\\s*ago/i, (m, v) => { const d = new Date(); d.setFullYear(d.getFullYear() - v); return d; }],
+                                                // Without "ago"
+                                                [/(\\d+)\\s*(?:min|minute)s?/i, (m, v) => { const d = new Date(); d.setMinutes(d.getMinutes() - v); return d; }],
+                                                [/(\\d+)\\s*(?:hour|hr)s?/i, (m, v) => { const d = new Date(); d.setHours(d.getHours() - v); return d; }],
+                                                [/(\\d+)\\s*(?:day|d)\\b/i, (m, v) => { const d = new Date(); d.setDate(d.getDate() - v); return d; }]
+                                            ];
+                                            
+                                            for (const [pattern, calc] of datePatterns) {
+                                                const match = dateText.match(pattern);
+                                                if (match) {
+                                                    try {
+                                                        const value = parseInt(match[1]);
+                                                        const date = calc(match, value);
+                                                        post.created_at = date.toISOString();
+                                                        break;
+                                                    } catch(e) {}
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Strategy 4: Check data attributes
+                                    if (!post.created_at) {
+                                        const dateAttr = elem.getAttribute('data-created') || 
+                                                        elem.getAttribute('data-timestamp') ||
+                                                        elem.getAttribute('data-date');
+                                        if (dateAttr) {
+                                            post.created_at = dateAttr;
+                                        }
+                                    }
+                                    
+                                    // Extract post URL if not already found - be more aggressive
+                                    if (!post.url) {
+                                        // Try data attributes
+                                        const dataUrn = elem.getAttribute('data-urn') || elem.getAttribute('data-update-urn');
+                                        if (dataUrn && (dataUrn.includes('activity') || dataUrn.includes('post'))) {
+                                            const id = dataUrn.split(':').pop();
+                                            post.url = `https://www.linkedin.com/feed/update/${id}`;
+                                        }
+                                        // Try finding any link with post pattern in the element
+                                        const allLinks = elem.querySelectorAll('a[href]');
+                                        for (const link of allLinks) {
+                                            const href = link.href || link.getAttribute('href') || '';
+                                            if (href.includes('/posts/') || href.includes('/activity-') || href.includes('/feed/update/')) {
+                                                post.url = href.split('?')[0];
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Extract LinkedIn post ID from URL if available
+                                    if (post.url) {
+                                        const postIdMatch = post.url.match(/\\/posts\\/([^\\/\\?]+)|activity-([^\\/\\?]+)|update\\/([^\\/\\?]+)/);
+                                        if (postIdMatch) {
+                                            post.linkedin_post_id = postIdMatch[1] || postIdMatch[2] || postIdMatch[3];
+                                        }
+                                    }
+                                    
+                                    // Extract post ID from data attributes if URL extraction failed
+                                    if (!post.linkedin_post_id) {
+                                        const dataUrn = elem.getAttribute('data-urn') || elem.getAttribute('data-update-urn');
+                                        if (dataUrn) {
+                                            const parts = dataUrn.split(':');
+                                            if (parts.length > 0) {
+                                                post.linkedin_post_id = parts[parts.length - 1];
+                                            }
+                                        }
                                     }
                                     
                                     // Only add if we have meaningful content
@@ -1076,24 +1332,90 @@ class LinkedInScraperService:
                             "image_url": js_post.get("image") or None,
                             "author_name": author_name,
                             "author_profile_url": author_url,
+                            "linkedin_post_id": js_post.get("linkedin_post_id") or None,
                             "likes": int(likes) if likes else 0,
                             "comments_count": int(comments_count) if comments_count else 0,
                             "shares": int(shares) if shares else 0,
                             "created_at": created_at,
                             "comments": []
                         }
-                        # Try to extract more details from HTML if available
+                        # Try to extract more details from HTML if available - ALWAYS TRY
+                        try:
+                            # First try from the full page HTML if we can access it
+                            full_page_content = await main_page.content()
+                            full_page_soup = BeautifulSoup(full_page_content, 'html.parser')
+                            
+                            # Find the matching post element in full page
+                            if js_post.get("text"):
+                                # Try to find this post in the full page by matching content
+                                post_elements = full_page_soup.find_all(['div', 'article'], class_=re.compile(r'feed-shared-update|update-components|feed-shared', re.I))
+                                for post_elem in post_elements:
+                                    if js_post.get("text", "")[:50] in post_elem.get_text():
+                                        # This is likely our post - extract from it
+                                        if not post_data.get("author_name"):
+                                            post_data["author_name"] = self._extract_post_author(post_elem)
+                                        if not post_data.get("post_url"):
+                                            post_data["post_url"] = self._extract_post_url(post_elem)
+                                        if post_data.get("likes", 0) == 0:
+                                            post_data["likes"] = self._extract_post_likes(post_elem)
+                                        if post_data.get("comments_count", 0) == 0:
+                                            post_data["comments_count"] = self._extract_post_comments_count(post_elem)
+                                        if post_data.get("shares", 0) == 0:
+                                            post_data["shares"] = self._extract_post_shares(post_elem)
+                                        if not post_data.get("created_at"):
+                                            post_data["created_at"] = self._extract_post_date(post_elem)
+                                        if not post_data.get("linkedin_post_id"):
+                                            data_urn = post_elem.get("data-urn") or post_elem.get("data-update-urn")
+                                            if data_urn and 'activity' in str(data_urn):
+                                                post_data["linkedin_post_id"] = str(data_urn).split(':')[-1] if ':' in str(data_urn) else str(data_urn)
+                                        break
+                        except Exception as e:
+                            pass  # Continue anyway
+                        
+                        # Also try from js_post HTML if available
                         if js_post.get("html"):
                             try:
                                 html_soup = BeautifulSoup(js_post["html"], 'html.parser')
-                                post_data["author_name"] = self._extract_post_author(html_soup)
-                                post_data["likes"] = self._extract_post_likes(html_soup)
-                                post_data["comments_count"] = self._extract_post_comments_count(html_soup)
-                                post_data["shares"] = self._extract_post_shares(html_soup)
-                                post_data["created_at"] = self._extract_post_date(html_soup)
+                                
+                                # Override with HTML extraction if not already found
+                                if not post_data.get("author_name"):
+                                    post_data["author_name"] = self._extract_post_author(html_soup)
+                                if not post_data.get("post_url"):
+                                    post_data["post_url"] = self._extract_post_url(html_soup)
+                                if post_data.get("likes", 0) == 0:
+                                    post_data["likes"] = self._extract_post_likes(html_soup)
+                                if post_data.get("comments_count", 0) == 0:
+                                    post_data["comments_count"] = self._extract_post_comments_count(html_soup)
+                                if post_data.get("shares", 0) == 0:
+                                    post_data["shares"] = self._extract_post_shares(html_soup)
+                                if not post_data.get("created_at"):
+                                    post_data["created_at"] = self._extract_post_date(html_soup)
+                                if not post_data.get("linkedin_post_id"):
+                                    # Try to extract from HTML attributes
+                                    data_urn = html_soup.find(attrs={"data-urn": True})
+                                    if data_urn and data_urn.get("data-urn"):
+                                        urn = data_urn.get("data-urn")
+                                        if 'activity' in urn:
+                                            post_data["linkedin_post_id"] = urn.split(':')[-1] if ':' in urn else urn
                             except Exception as e:
-                                print(f"[DEBUG] Error extracting post details from HTML: {e}")
-                                # Continue with basic data
+                                pass  # Continue with basic data
+                        
+                        # Final fallback: Try to extract author from content if mentioned
+                        if not post_data.get("author_name") and post_data.get("content"):
+                            content = post_data["content"]
+                            # Look for "By [Name]" or "Posted by [Name]" patterns
+                            author_patterns = [
+                                r'by\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
+                                r'posted\s+by\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
+                                r'author[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
+                                r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+posted',
+                                r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+shared',
+                            ]
+                            for pattern in author_patterns:
+                                match = re.search(pattern, content, re.IGNORECASE)
+                                if match:
+                                    post_data["author_name"] = match.group(1)
+                                    break
                         
                         # Only add if we have meaningful content
                         if post_data.get("content") and len(post_data.get("content", "")) > 20:
@@ -1118,14 +1440,28 @@ class LinkedInScraperService:
                     post_data = {
                         "content": self._extract_post_content(post_elem),
                         "author_name": self._extract_post_author(post_elem),
-                        "likes": self._extract_post_likes(post_elem),
-                        "comments_count": self._extract_post_comments_count(post_elem),
-                        "shares": self._extract_post_shares(post_elem),
+                        "likes": self._extract_post_likes(post_elem) or 0,
+                        "comments_count": self._extract_post_comments_count(post_elem) or 0,
+                        "shares": self._extract_post_shares(post_elem) or 0,
                         "post_url": self._extract_post_url(post_elem),
-                        "image_url": self._extract_post_image(post_elem),
                         "created_at": self._extract_post_date(post_elem),
+                        "linkedin_post_id": None,
                         "comments": []
                     }
+                    
+                    # Extract LinkedIn post ID from URL if available
+                    if post_data.get("post_url"):
+                        url = post_data["post_url"]
+                        post_id_match = re.search(r'/posts/([^/?]+)|activity-([^/?]+)|/feed/update/([^/?]+)', url)
+                        if post_id_match:
+                            post_data["linkedin_post_id"] = post_id_match.group(1) or post_id_match.group(2) or post_id_match.group(3)
+                    
+                    # Extract author profile URL if author found
+                    if post_data.get("author_name"):
+                        author_link = post_elem.select_one('a[href*="/in/"]')
+                        if author_link:
+                            post_data["author_profile_url"] = author_link.get('href', '').split('?')[0]
+                    
                     if post_data.get("content") or post_data.get("post_url"):
                         posts.append(post_data)
                 
@@ -1508,14 +1844,18 @@ class LinkedInScraperService:
                 js_people = await main_page.evaluate("""
                     () => {
                         const people = [];
-                        // Look for people/employee elements
+                        const seenUrls = new Set(); // Deduplicate by URL
+                        
+                        // Strategy 1: Look for people/employee elements
                         const selectors = [
                             '[class*="entity-result"]',
                             '[class*="search-result"]',
                             '[class*="people"]',
                             '[class*="employee"]',
                             '[class*="member"]',
-                            'li[class*="people"]'
+                            'li[class*="people"]',
+                            '[class*="org-people-profile-card"]',
+                            '[class*="reusable-search"]'
                         ];
                         
                         for (const selector of selectors) {
@@ -1530,7 +1870,11 @@ class LinkedInScraperService:
                                     const link = elem.querySelector('a[href*="/in/"]');
                                     if (!link) continue;  // Skip if no profile link
                                     
-                                    const person = { text: text, url: link.href };
+                                    const url = link.href.split('?')[0];
+                                    if (seenUrls.has(url)) continue; // Skip duplicates
+                                    seenUrls.add(url);
+                                    
+                                    const person = { text: text, url: url };
                                     
                                     // Try to find name
                                     const nameElem = elem.querySelector('[class*="name"], h3, h2, a[href*="/in/"]');
@@ -1556,8 +1900,58 @@ class LinkedInScraperService:
                                     }
                                 }
                             }
-                            if (people.length >= 50) break;
+                            if (people.length >= 100) break;
                         }
+                        
+                        // Strategy 2: Extract ALL profile links from the page (post authors, commenters, etc.)
+                        if (people.length < 50) {
+                            const allProfileLinks = document.querySelectorAll('a[href*="/in/"]');
+                            for (const link of allProfileLinks) {
+                                const url = link.href.split('?')[0];
+                                // Skip if already seen
+                                if (seenUrls.has(url)) continue;
+                                // Skip company pages
+                                if (url.includes('/company/')) continue;
+                                
+                                // Try to get name from link text or nearby elements
+                                let name = link.textContent.trim();
+                                if (!name || name.length < 2) {
+                                    // Try parent
+                                    let parent = link.parentElement;
+                                    for (let i = 0; i < 3 && parent; i++) {
+                                        const spans = parent.querySelectorAll('span');
+                                        for (const span of spans) {
+                                            const text = span.textContent.trim();
+                                            if (text && text.length > 2 && text.length < 100 && 
+                                                !text.match(/^\\d+$/) && 
+                                                !text.toLowerCase().includes('followers') &&
+                                                !text.toLowerCase().includes('view profile')) {
+                                                name = text;
+                                                break;
+                                            }
+                                        }
+                                        if (name && name.length > 2) break;
+                                        parent = parent.parentElement;
+                                    }
+                                }
+                                
+                                // Validate name
+                                if (name && name.length > 2 && name.length < 100 && 
+                                    !name.toLowerCase().includes('jobs') &&
+                                    !name.toLowerCase().includes('linkedin') &&
+                                    !name.match(/^\\d+$/)) {
+                                    seenUrls.add(url);
+                                    people.push({
+                                        name: name,
+                                        url: url,
+                                        text: name
+                                    });
+                                }
+                                
+                                if (people.length >= 100) break;
+                            }
+                        }
+                        
                         return people;
                     }
                 """)
@@ -1572,7 +1966,7 @@ class LinkedInScraperService:
                             "headline": js_person.get("headline"),
                             "location": None,
                             "current_position": js_person.get("headline"),
-                            "profile_picture": js_person.get("image"),
+                            "connection_count": None,
                         }
                         
                         if person_data.get("name") and len(person_data["name"]) > 2:
@@ -1587,13 +1981,13 @@ class LinkedInScraperService:
             
             await main_page.close()
         except asyncio.TimeoutError:
-            print(f"[DEBUG] Timeout extracting people from main page")
+            print(f"[DEBUG] Timeout extracting people from main page - will try people page or fallback to posts")
             try:
                 await main_page.close()
             except:
                 pass
         except Exception as e:
-            print(f"[DEBUG] Could not extract people from main page: {e}")
+            print(f"[DEBUG] Could not extract people from main page: {e} - will try people page or fallback to posts")
             try:
                 await main_page.close()
             except:
@@ -1904,13 +2298,38 @@ class LinkedInScraperService:
                     people.append(person_data)
             
             print(f"[DEBUG] Successfully extracted {len(people)} people for {page_id}")
-            return people
+            if len(people) > 0:
+                await page.close()
+                return people
             
+        except asyncio.TimeoutError:
+            print(f"[WARNING] Timeout accessing people page for {page_id}")
+            try:
+                await page.close()
+            except:
+                pass
         except Exception as e:
             print(f"Error scraping people for {page_id}: {e}")
-            return people
-        finally:
-            await page.close()
+            try:
+                await page.close()
+            except:
+                pass
+        
+        # If we get here, either timeout or error occurred - try fallback to extract from posts
+        print("[INFO] Attempting to extract people from post authors as fallback...")
+        try:
+            posts_data = await self.scrape_posts(page_id, max_posts=50)
+            if posts_data:
+                people_from_posts = await self._extract_people_from_posts(posts_data)
+                if people_from_posts:
+                    print(f"[INFO] Extracted {len(people_from_posts)} people from post authors")
+                    return people_from_posts
+        except Exception as e:
+            print(f"[DEBUG] Failed to extract people from posts: {e}")
+            import traceback
+            print(f"[DEBUG] Traceback: {traceback.format_exc()}")
+        
+        return []
     
     async def _scrape_post_comments(self, post_url: str) -> List[Dict[str, Any]]:
         """Scrape comments for a specific post."""
@@ -2195,7 +2614,25 @@ class LinkedInScraperService:
         return None
     
     def _extract_website(self, soup: BeautifulSoup) -> Optional[str]:
-        """Extract company website."""
+        """Extract company website - exclude location URLs, maps URLs, etc."""
+        # List of URL patterns to exclude (location URLs, maps, etc.)
+        exclude_patterns = [
+            'bing.com/maps',
+            'google.com/maps',
+            'maps.google.com',
+            'maps.bing.com',
+            'openstreetmap.org',
+            'mapquest.com',
+            'location',
+            'directions',
+            'trk=org-locations_url',
+            'org-locations',
+            'address',
+            'find-us',
+            'contact-us',
+            'get-directions',
+        ]
+        
         # Try multiple selectors for website link
         website_selectors = [
             'a.org-top-card-primary-content__website-link',
@@ -2211,16 +2648,28 @@ class LinkedInScraperService:
             for link in links:
                 href = link.get('href', '').strip()
                 text = link.get_text(strip=True)
+                
+                # Check if this is a location/maps URL
+                is_excluded = any(pattern in href.lower() for pattern in exclude_patterns) if href else False
+                
                 # Prefer href if it's a valid URL
                 if href and (href.startswith('http://') or href.startswith('https://')):
-                    if 'linkedin.com' not in href.lower() and 'linkedin' not in href.lower():
+                    if ('linkedin.com' not in href.lower() and 'linkedin' not in href.lower() and 
+                        not is_excluded):
                         return href
                 # Otherwise use text if it looks like a URL
                 elif text and (text.startswith('http://') or text.startswith('https://')):
-                    if 'linkedin.com' not in text.lower():
+                    is_excluded_text = any(pattern in text.lower() for pattern in exclude_patterns)
+                    if ('linkedin.com' not in text.lower() and not is_excluded_text):
                         return text
         
         # Try extracting from structured data/JSON
+        exclude_patterns = [
+            'bing.com/maps', 'google.com/maps', 'maps.google.com', 'maps.bing.com',
+            'openstreetmap.org', 'mapquest.com', 'location', 'directions',
+            'trk=org-locations_url', 'org-locations', 'address'
+        ]
+        
         website_patterns = [
             r'"website":\s*"([^"]+)"',
             r'"url":\s*"([^"]+)"',
@@ -2230,40 +2679,106 @@ class LinkedInScraperService:
             website_match = re.search(pattern, str(soup))
             if website_match:
                 website = website_match.group(1)
-                if website and 'linkedin.com' not in website.lower() and (website.startswith('http://') or website.startswith('https://')):
+                is_excluded = any(pattern in website.lower() for pattern in exclude_patterns)
+                if (website and 'linkedin.com' not in website.lower() and 
+                    not is_excluded and 
+                    (website.startswith('http://') or website.startswith('https://'))):
                     return website
         
         # Try extracting from JSON-LD
+        exclude_patterns = [
+            'bing.com/maps', 'google.com/maps', 'maps.google.com', 'maps.bing.com',
+            'openstreetmap.org', 'mapquest.com', 'location', 'directions',
+            'trk=org-locations_url', 'org-locations', 'address'
+        ]
+        
         json_ld_scripts = soup.select('script[type="application/ld+json"]')
         for json_ld in json_ld_scripts:
             try:
                 import json
                 data = json.loads(json_ld.string)
                 if isinstance(data, dict):
-                    if 'url' in data and data['url'] and 'linkedin.com' not in str(data['url']).lower():
-                        return data['url']
+                    if 'url' in data and data['url']:
+                        url_str = str(data['url']).lower()
+                        is_excluded = any(pattern in url_str for pattern in exclude_patterns)
+                        if 'linkedin.com' not in url_str and not is_excluded:
+                            return data['url']
                     if 'sameAs' in data:
                         same_as = data['sameAs']
                         if isinstance(same_as, list):
                             for url in same_as:
-                                if url and 'linkedin.com' not in str(url).lower() and (str(url).startswith('http://') or str(url).startswith('https://')):
-                                    return url
-                        elif isinstance(same_as, str) and 'linkedin.com' not in same_as.lower():
-                            return same_as
+                                if url:
+                                    url_str = str(url).lower()
+                                    is_excluded = any(pattern in url_str for pattern in exclude_patterns)
+                                    if ('linkedin.com' not in url_str and not is_excluded and 
+                                        (str(url).startswith('http://') or str(url).startswith('https://'))):
+                                        return url
+                        elif isinstance(same_as, str):
+                            url_str = same_as.lower()
+                            is_excluded = any(pattern in url_str for pattern in exclude_patterns)
+                            if 'linkedin.com' not in url_str and not is_excluded:
+                                return same_as
             except:
                 pass
         
         return None
     
-    def _extract_industry(self, soup: BeautifulSoup, content: str = "") -> Optional[str]:
-        """Extract industry."""
-        # Try specific industry selectors first
+    def _extract_industry(self, soup: BeautifulSoup, content: str = "", description: str = "") -> Optional[str]:
+        """Extract industry - try description if industry field is not available."""
+        # First, try to find industry using label-value pattern (About section structure: dt/dd pairs)
+        # Look for dt/dd pairs where dt contains "Industry" and dd contains the value
+        try:
+            # Method 1: Look for dt elements with "Industry" text
+            dt_elements = soup.select('dt, [data-test-id*="industry-label"], .org-page-details__definition-key')
+            for dt_elem in dt_elements:
+                dt_text = dt_elem.get_text(strip=True).lower()
+                if 'industry' in dt_text:
+                    # Try to find the corresponding value (next sibling dd)
+                    value_elem = dt_elem.find_next_sibling('dd')
+                    if not value_elem:
+                        # Try parent container
+                        parent = dt_elem.parent
+                        if parent:
+                            # Look for dd in parent
+                            value_elem = parent.select_one('dd')
+                    
+                    if value_elem:
+                        industry_value = value_elem.get_text(strip=True)
+                        if industry_value and len(industry_value) > 2 and len(industry_value) < 100:
+                            # Filter out if it's just the label again
+                            if industry_value.lower() != 'industry':
+                                return industry_value
+        except Exception as e:
+            pass
+        
+        # Method 2: Look for About section structure (dl > dt + dd pattern)
+        try:
+            dl_elements = soup.select('dl.org-page-details__definition-list, .org-about-section-content-module dl')
+            for dl in dl_elements:
+                dts = dl.select('dt')
+                for dt in dts:
+                    if 'industry' in dt.get_text(strip=True).lower():
+                        dd = dt.find_next_sibling('dd')
+                        if dd:
+                            industry_value = dd.get_text(strip=True)
+                            if industry_value and len(industry_value) > 2 and len(industry_value) < 100:
+                                if industry_value.lower() != 'industry':
+                                    return industry_value
+        except Exception as e:
+            pass
+        
+        # Try specific industry selectors first (including About section selectors)
         industry_selectors = [
             '[data-test-id="industry"]',
             '.org-top-card-summary-info-list__info-item',
             '.top-card-layout__first-subline',
             '.org-top-card-summary-info-list__info-item',
             '.org-top-card-summary-info-list',
+            # About section selectors
+            'dd.org-page-details__definition-text',
+            '.org-about-section-content-module__content dd',
+            '[data-test-id="about-us-industry"]',
+            '.org-about-us-organization-details__item dd',
         ]
         
         for selector in industry_selectors:
@@ -2284,22 +2799,53 @@ class LinkedInScraperService:
                             if any(ind in text.lower() for ind in common_industries) or len(text.split()) <= 3:
                                 return text
         
-        # Try extracting from description if it mentions industry
-        description_elem = soup.select_one('.org-top-card-summary-info-list, .org-top-card-primary-content')
-        if description_elem:
-            desc_text = description_elem.get_text()
-            # Look for industry keywords in description
-            industry_keywords = ['education', 'placement', 'career services', 'recruitment', 'higher education']
-            for keyword in industry_keywords:
-                if keyword in desc_text.lower():
-                    # Try to extract the full industry phrase
-                    # Build pattern outside f-string to avoid backslash issue
-                    keyword_pattern = keyword.replace(" ", r"\s+")
-                    pattern = rf'([A-Z][a-z]+(?:\s+[A-Z]?[a-z]+)*\s*(?:{re.escape(keyword)}|{keyword_pattern}))'
-                    industry_match = re.search(pattern, desc_text, re.IGNORECASE)
-                    if industry_match:
-                        return industry_match.group(1).strip()
-                    return keyword.title()
+        # Try extracting from description if it mentions industry (e.g., "IT Services and IT Consulting")
+        desc_text = description if description else ""
+        if not desc_text:
+            description_elem = soup.select_one('.org-top-card-summary-info-list, .org-top-card-primary-content, [class*="description"]')
+            if description_elem:
+                desc_text = description_elem.get_text()
+        
+        if desc_text:
+            # Common industry patterns in descriptions
+            # Look for patterns like "IT Services and IT Consulting", "Technology Services", etc.
+            industry_patterns = [
+                r'(IT\s+Services?\s+and\s+IT\s+Consulting)',
+                r'(Technology\s+Services?)',
+                r'(Software\s+(?:Development|Services|Solutions))',
+                r'(Internet\s+[\w\s]+)',
+                r'(Financial\s+Services?)',
+                r'(Healthcare\s+[\w\s]+)',
+                r'(Education\s+[\w\s]+)',
+                r'(Consulting\s+Services?)',
+                r'([A-Z][a-z]+\s+Services?\s+and\s+[A-Z][a-z]+\s+Consulting)',
+            ]
+            
+            for pattern in industry_patterns:
+                match = re.search(pattern, desc_text, re.IGNORECASE)
+                if match:
+                    industry = match.group(1).strip()
+                    # Clean up and return
+                    if len(industry) > 3 and len(industry) < 100:
+                        return industry
+            
+            # Fallback: Look for industry keywords in description
+            industry_keywords = [
+                ('IT Services and IT Consulting', 'IT Services and IT Consulting'),
+                ('education', 'Education'),
+                ('placement', 'Placement'),
+                ('career services', 'Career Services'),
+                ('recruitment', 'Recruitment'),
+                ('higher education', 'Higher Education'),
+                ('technology', 'Technology'),
+                ('software', 'Software'),
+                ('consulting', 'Consulting'),
+                ('financial services', 'Financial Services'),
+                ('healthcare', 'Healthcare'),
+            ]
+            for keyword, industry_name in industry_keywords:
+                if keyword.lower() in desc_text.lower():
+                    return industry_name
         
         # Try extracting from structured data/JSON
         industry_patterns = [
@@ -2433,30 +2979,105 @@ class LinkedInScraperService:
         return None
     
     def _extract_head_count(self, soup: BeautifulSoup, content: str = "") -> Optional[str]:
-        """Extract head count."""
-        # Look for employee count information with more specific patterns
-        info_items = soup.select('.org-top-card-summary-info-list__info-item, .top-card-layout__first-subline')
-        for item in info_items:
-            text = item.get_text(strip=True)
-            # Look for employee-related text but exclude followers
-            if 'employee' in text.lower() and 'follower' not in text.lower():
-                # Clean up the text
-                text_clean = re.sub(r'\d+[,\d]*\s*followers?', '', text, flags=re.IGNORECASE).strip()
-                if text_clean:
-                    return text_clean
-            # Look for employee count patterns
-            if re.search(r'\d+[,\d]*\s*employees?', text, re.I):
-                return text
-            # Look for range patterns like "10,001-50,000 employees"
-            if re.search(r'\d+[,\d]*-\d+[,\d]*\s*employees?', text, re.I):
-                return text
+        """Extract head count - supports ranges like '5k to 10k employees'."""
+        # Get all text from page
+        page_text = soup.get_text()
+        all_text = page_text + " " + content
+        
+        # Pattern 1: Ranges with K notation like "5k to 10k employees", "5K-10K employees"
+        range_patterns_k = [
+            r'(\d+[.,]?\d*)\s*[kK]\s*(?:to|-)\s*(\d+[.,]?\d*)\s*[kK]\s*employees?',
+            r'(\d+[.,]?\d*)\s*[kK]\s*(?:to|-)\s*(\d+[.,]?\d*)\s*[kK]\s*employee',
+        ]
+        for pattern in range_patterns_k:
+            match = re.search(pattern, all_text, re.IGNORECASE)
+            if match:
+                lower = match.group(1).replace(',', '.')
+                upper = match.group(2).replace(',', '.')
+                return f"{lower}k to {upper}k employees"
+        
+        # Pattern 2: Standard ranges like "5,001-10,000 employees", "10,001-50,000 employees"
+        range_patterns_standard = [
+            r'(\d+[,\d]*)\s*-\s*(\d+[,\d]*)\s*employees?',
+            r'(\d+[,\d]*)\s*to\s*(\d+[,\d]*)\s*employees?',
+        ]
+        for pattern in range_patterns_standard:
+            match = re.search(pattern, all_text, re.IGNORECASE)
+            if match:
+                return match.group(0).strip()
+        
+        # Pattern 3: Single number with K/M notation like "5k employees", "10K employees"
+        single_k_patterns = [
+            r'(\d+[.,]?\d*)\s*[kK]\s*employees?',
+            r'(\d+[.,]?\d*)\s*[mM]\s*employees?',
+        ]
+        for pattern in single_k_patterns:
+            match = re.search(pattern, all_text, re.IGNORECASE)
+            if match:
+                num = match.group(1).replace(',', '.')
+                suffix = 'k' if 'k' in match.group(0).lower() else 'M'
+                return f"{num}{suffix} employees"
+        
+        # Look for employee count information with more specific patterns in elements (including About section)
+        info_selectors = [
+            '.org-top-card-summary-info-list__info-item',
+            '.top-card-layout__first-subline',
+            '[class*="employee"]',
+            '[class*="head-count"]',
+            # About section selectors
+            'dd.org-page-details__definition-text',
+            '.org-about-section-content-module__content dd',
+            '[data-test-id="about-us-company-size"]',
+            '.org-about-us-organization-details__item dd',
+            'dt:contains("Company size") + dd',
+            'dt[data-test-id*="company-size"] + dd',
+            'dt[data-test-id*="employees"] + dd',
+        ]
+        
+        for selector in info_selectors:
+            try:
+                items = soup.select(selector)
+                for item in items:
+                    text = item.get_text(strip=True)
+                    
+                    # Check if this is a company size field (look for "Company size" label nearby)
+                    parent = item.parent if item.parent else None
+                    if parent:
+                        parent_text = parent.get_text()
+                        # If parent contains "Company size" or "employees" label, this is likely the value
+                        if ('company size' in parent_text.lower() or 'employees' in parent_text.lower()) and text:
+                            if len(text) > 2 and len(text) < 100:
+                                # Check if it contains employee count pattern
+                                if re.search(r'\d+.*employee|employee.*\d+', text, re.I) or re.search(r'\d+.*\d+', text):
+                                    return text
+                    
+                    # Look for employee-related text but exclude followers
+                    if 'employee' in text.lower() and 'follower' not in text.lower():
+                        # Clean up the text
+                        text_clean = re.sub(r'\d+[,\d]*\s*followers?', '', text, flags=re.IGNORECASE).strip()
+                        if text_clean and len(text_clean) > 5:
+                            # Check if it contains a range pattern
+                            if re.search(r'\d+.*\d+.*employee', text_clean, re.I):
+                                return text_clean
+                            # Or single number
+                            if re.search(r'\d+.*employee', text_clean, re.I):
+                                return text_clean
+                    # Look for employee count patterns
+                    if re.search(r'\d+[,\d]*\s*employees?', text, re.I):
+                        return text
+                    # Look for range patterns
+                    if re.search(r'\d+.*\d+.*employees?', text, re.I):
+                        return text
+            except:
+                continue
         
         # Try extracting from structured data with multiple patterns
         employee_patterns = [
             r'"employeesCount":\s*"([^"]+)"',
-            r'"employeeCount":\s*(\d+)',
+            r'"employeeCount":\s*"([^"]+)"',
             r'"headCount":\s*"([^"]+)"',
             r'"staffSize":\s*"([^"]+)"',
+            r'"employeeRange":\s*"([^"]+)"',
         ]
         for pattern in employee_patterns:
             employees_match = re.search(pattern, content)
@@ -2706,68 +3327,211 @@ class LinkedInScraperService:
         return ""
     
     def _extract_post_author(self, elem) -> Optional[str]:
-        """Extract post author."""
-        author = elem.select_one('.feed-shared-actor__name, .update-components-actor__name')
-        if author:
-            return author.get_text(strip=True)
+        """Extract post author with multiple strategies."""
+        # Strategy 1: Standard selectors (expanded)
+        selectors = [
+            '.feed-shared-actor__name',
+            '.update-components-actor__name',
+            '[class*="actor__name"]',
+            '[class*="feed-shared-actor"] a[href*="/in/"]',
+            '[class*="actor"] a[href*="/in/"]',
+            'a[href*="/in/"][class*="actor"]',
+            '[class*="feed-shared-actor"] span',
+            '[class*="actor"] span',
+            '[aria-label*="posted by"]',
+            '[aria-label*="author"]'
+        ]
+        for selector in selectors:
+            author = elem.select_one(selector)
+            if author:
+                text = author.get_text(strip=True)
+                # Check aria-label too
+                if not text:
+                    text = author.get('aria-label', '')
+                if text and len(text) > 2 and len(text) < 100 and not text.isdigit() and not 'linkedin' in text.lower():
+                    # Filter out common non-name text
+                    if text.lower() not in ['show more', 'see more', 'follow', 'connect', 'message']:
+                        return text
+        
+        # Strategy 1.5: More aggressive - check any link with /in/ in the first part of the element
+        profile_links = elem.select('a[href*="/in/"]')
+        for link in profile_links[:3]:  # Only check first 3 to avoid false positives
+            href = link.get('href', '')
+            # Skip company links
+            if '/company/' in href:
+                continue
+            
+            # Get text from link itself
+            link_text = link.get_text(strip=True)
+            if link_text and len(link_text) > 2 and len(link_text) < 100 and not link_text.isdigit():
+                if link_text.lower() not in ['show more', 'see more', 'follow', 'connect', 'message', 'view profile', 'linkedin']:
+                    return link_text
+            
+            # Check parent/sibling for name
+            parent = link.parent
+            if parent:
+                # Look for span or div with name-like text in parent
+                name_elems = parent.select('span, div')
+                for name_elem in name_elems[:5]:  # Limit search
+                    name_text = name_elem.get_text(strip=True)
+                    # Check if it looks like a name (2-4 words, capitalized)
+                    name_match = re.search(r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})$', name_text)
+                    if name_match and len(name_text) > 3 and len(name_text) < 50:
+                        if name_text.lower() not in ['followers', 'view profile', 'show more', 'linkedin']:
+                            return name_text
+        
+        # Strategy 2: Look for any /in/ link and get nearby text (more aggressive)
+        profile_links = elem.select('a[href*="/in/"]')
+        for link in profile_links:
+            # Skip if it's a company page link
+            href = link.get('href', '')
+            if '/company/' in href:
+                continue
+            
+            # Get text from link
+            text = link.get_text(strip=True)
+            if text and len(text) > 2 and len(text) < 100 and not text.isdigit():
+                # Filter out common non-name text
+                if text.lower() not in ['show more', 'see more', 'follow', 'connect', 'message', 'linkedin']:
+                    return text
+            
+            # Check parent for name
+            parent = link.parent
+            if parent:
+                parent_text = parent.get_text(strip=True)
+                # Extract name-like pattern (first line usually has name)
+                first_line = parent_text.split('\n')[0].strip()
+                name_match = re.search(r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})', first_line)
+                if name_match:
+                    name = name_match.group(1)
+                    if len(name) > 2 and len(name) < 100:
+                        return name
+                
+                # Also try broader pattern
+                name_match = re.search(r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})', parent_text[:200])
+                if name_match:
+                    name = name_match.group(1)
+                    if len(name) > 2 and len(name) < 100:
+                        return name
+        
+        # Strategy 3: Look for name in the beginning of the element text
+        elem_text = elem.get_text()
+        first_lines = elem_text.split('\n')[:5]  # Check first 5 lines
+        for line in first_lines:
+            line = line.strip()
+            name_match = re.search(r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})', line)
+            if name_match:
+                name = name_match.group(1)
+                if len(name) > 2 and len(name) < 100:
+                    # Check it's not a common word
+                    if name.lower() not in ['linkedin', 'company', 'followers', 'follow', 'connect']:
+                        return name
+        
         return None
     
     def _extract_post_likes(self, elem) -> int:
-        """Extract post likes count."""
-        # Try multiple selectors
+        """Extract post likes count with multiple strategies."""
+        # Strategy 1: Try multiple selectors
         selectors = [
             '.social-actions-button__reactions-count',
             '[data-test-id="social-actions__reactions-count"]',
             '.social-actions-button__reactions-count-button',
             'button[aria-label*="reaction"]',
-            'span:has-text("reaction")',
+            'button[aria-label*="like"]',
+            '[class*="reaction"]',
+            '[class*="social-action"]'
         ]
         for selector in selectors:
-            likes = elem.select_one(selector)
-            if likes:
-                text = likes.get_text(strip=True)
-                # Handle K, M suffixes
-                text_clean = text.replace(',', '').replace(' ', '')
-                match = re.search(r'([\d.]+)\s*([KMkm]?)', text_clean)
-                if match:
-                    try:
-                        num = float(match.group(1))
-                        suffix = match.group(2).upper()
-                        if suffix == 'K':
-                            num *= 1000
-                        elif suffix == 'M':
-                            num *= 1000000
-                        return int(num)
-                    except:
-                        pass
-                # Try simple number
-                match = re.search(r'(\d+)', text.replace(',', ''))
-                if match:
-                    try:
-                        return int(match.group(1))
-                    except:
-                        pass
+            elements = elem.select(selector)
+            for el in elements:
+                # Check aria-label first
+                aria_label = el.get('aria-label', '')
+                if aria_label:
+                    match = re.search(r'(\d+[,\d]*)', aria_label.replace(',', ''))
+                    if match:
+                        try:
+                            return int(match.group(1))
+                        except:
+                            pass
+                
+                # Check text content
+                text = el.get_text(strip=True)
+                if text:
+                    # Handle K, M suffixes
+                    text_clean = text.replace(',', '').replace(' ', '')
+                    match = re.search(r'([\d.]+)\s*([KMkm]?)', text_clean)
+                    if match:
+                        try:
+                            num = float(match.group(1))
+                            suffix = match.group(2).upper()
+                            if suffix == 'K':
+                                num *= 1000
+                            elif suffix == 'M':
+                                num *= 1000000
+                            return int(num)
+                        except:
+                            pass
+                    # Try simple number
+                    match = re.search(r'(\d+)', text.replace(',', ''))
+                    if match:
+                        try:
+                            return int(match.group(1))
+                        except:
+                            pass
+        
+        # Strategy 2: Look for reaction text in element
+        elem_text = elem.get_text()
+        reaction_match = re.search(r'(\d+[,\d]*)\s*(?:reactions?|likes?)', elem_text, re.IGNORECASE)
+        if reaction_match:
+            try:
+                return int(reaction_match.group(1).replace(',', ''))
+            except:
+                pass
+        
         return 0
     
     def _extract_post_comments_count(self, elem) -> int:
-        """Extract post comments count."""
-        # Try multiple selectors
+        """Extract post comments count with multiple strategies."""
+        # Strategy 1: Try multiple selectors
         selectors = [
             '.social-actions-button__comment-count',
             '[data-test-id="social-actions__comments-count"]',
             'button[aria-label*="comment"]',
-            # Note: :has-text() is Playwright-only, not supported in BeautifulSoup
+            '[class*="comment"]',
+            '[class*="social-action"][class*="comment"]'
         ]
         for selector in selectors:
-            comments = elem.select_one(selector)
-            if comments:
-                text = comments.get_text(strip=True)
-                match = re.search(r'(\d+)', text.replace(',', ''))
-                if match:
-                    try:
-                        return int(match.group(1))
-                    except:
-                        pass
+            elements = elem.select(selector)
+            for el in elements:
+                # Check aria-label first
+                aria_label = el.get('aria-label', '')
+                if aria_label and 'comment' in aria_label.lower():
+                    match = re.search(r'(\d+[,\d]*)', aria_label.replace(',', ''))
+                    if match:
+                        try:
+                            return int(match.group(1))
+                        except:
+                            pass
+                
+                # Check text content
+                text = el.get_text(strip=True)
+                if text:
+                    match = re.search(r'(\d+[,\d]*)', text.replace(',', ''))
+                    if match:
+                        try:
+                            return int(match.group(1))
+                        except:
+                            pass
+        
+        # Strategy 2: Look for comment text in element
+        elem_text = elem.get_text()
+        comment_match = re.search(r'(\d+[,\d]*)\s*comments?', elem_text, re.IGNORECASE)
+        if comment_match:
+            try:
+                return int(comment_match.group(1).replace(',', ''))
+            except:
+                pass
+        
         return 0
     
     def _extract_post_shares(self, elem) -> int:
@@ -2784,24 +3548,26 @@ class LinkedInScraperService:
         return 0
     
     def _extract_post_url(self, elem) -> Optional[str]:
-        """Extract post URL."""
-        # Try multiple selectors
+        """Extract post URL with multiple strategies."""
+        # Strategy 1: Try multiple selectors
         selectors = [
             'a[href*="/posts/"]',
             'a[href*="/activity-"]',
+            'a[href*="/feed/update/"]',
             'a[data-test-id="post-link"]',
             'a.feed-shared-update-v2__description-wrapper',
+            'a[href*="/recent-activity/"]'
         ]
         for selector in selectors:
-            link = elem.select_one(selector)
-            if link:
+            links = elem.select(selector)
+            for link in links:
                 href = link.get('href')
-                if href:
+                if href and ('/posts/' in href or '/activity-' in href or '/feed/update/' in href):
                     if not href.startswith('http'):
-                        return f"https://www.linkedin.com{href}"
-                    return href
+                        return f"https://www.linkedin.com{href.split('?')[0]}"
+                    return href.split('?')[0]  # Remove query params
         
-        # Try to extract from data attributes
+        # Strategy 2: Extract from data attributes
         if elem.get('data-urn'):
             urn = elem.get('data-urn')
             # Convert URN to URL if possible
@@ -2809,29 +3575,121 @@ class LinkedInScraperService:
                 activity_id = urn.split(':')[-1] if ':' in urn else urn
                 return f"https://www.linkedin.com/feed/update/{activity_id}"
         
+        # Strategy 3: Look for any link with post-like patterns
+        all_links = elem.select('a[href]')
+        for link in all_links:
+            href = link.get('href', '')
+            if any(pattern in href for pattern in ['/posts/', '/activity-', '/feed/update/']):
+                if not href.startswith('http'):
+                    return f"https://www.linkedin.com{href.split('?')[0]}"
+                return href.split('?')[0]
+        
         return None
     
     def _extract_post_image(self, elem) -> Optional[str]:
-        """Extract post image URL."""
-        img = elem.select_one('img.feed-shared-image, img.update-components-image')
-        if img:
-            return img.get('src') or img.get('data-src')
+        """Extract post image URL with multiple strategies."""
+        # Strategy 1: Standard selectors
+        selectors = [
+            'img.feed-shared-image',
+            'img.update-components-image',
+            'img[class*="feed-shared-image"]',
+            'img[class*="update-components-image"]',
+            'img[src*="media.licdn.com"]'
+        ]
+        for selector in selectors:
+            imgs = elem.select(selector)
+            for img in imgs:
+                src = img.get('src') or img.get('data-src') or img.get('data-delayed-url')
+                if src and 'media.licdn.com' in src:
+                    # Filter out logos and profile pics
+                    if not any(x in src.lower() for x in ['logo', 'profile', 'company-logo', 'ghost', 'blank']):
+                        return src.split('?')[0]  # Remove query params
+        
+        # Strategy 2: Look for any image with media.licdn.com
+        all_imgs = elem.select('img[src*="media.licdn.com"]')
+        for img in all_imgs:
+            src = img.get('src') or img.get('data-src')
+            if src and not any(x in src.lower() for x in ['logo', 'profile', 'company-logo', 'ghost', 'blank']):
+                return src.split('?')[0]
+        
         return None
     
     def _extract_post_date(self, elem) -> Optional[datetime]:
-        """Extract post date."""
-        date_elem = elem.select_one('.feed-shared-actor__sub-description, time')
-        if date_elem:
-            datetime_attr = date_elem.get('datetime')
+        """Extract post date with multiple strategies."""
+        # Strategy 1: Try ALL time elements with datetime attribute
+        time_elems = elem.select('time[datetime]')
+        for time_elem in time_elems:
+            datetime_attr = time_elem.get('datetime')
             if datetime_attr:
                 try:
                     return datetime.fromisoformat(datetime_attr.replace('Z', '+00:00'))
                 except:
                     pass
+        
+        # Strategy 2: Try other date selectors (expanded)
+        date_selectors = [
+            '.feed-shared-actor__sub-description',
+            '[class*="timestamp"]',
+            '[class*="time"]',
+            '[class*="date"]',
+            'time',
+            '[data-test-id*="time"]',
+            '[aria-label*="time"]'
+        ]
+        for selector in date_selectors:
+            date_elems = elem.select(selector)
+            for date_elem in date_elems:
+                datetime_attr = date_elem.get('datetime') or date_elem.get('data-time')
+                if datetime_attr:
+                    try:
+                        return datetime.fromisoformat(datetime_attr.replace('Z', '+00:00'))
+                    except:
+                        pass
+                # Also check aria-label
+                aria_label = date_elem.get('aria-label', '')
+                if aria_label:
+                    # Try to extract ISO date from aria-label
+                    iso_match = re.search(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', aria_label)
+                    if iso_match:
+                        try:
+                            return datetime.fromisoformat(iso_match.group(1))
+                        except:
+                            pass
+        
+        # Strategy 3: Try to parse relative time from text (e.g., "2d ago", "1 week ago") - expanded patterns
+        elem_text = elem.get_text()
+        date_patterns = [
+            (r'(\d+)\s*(?:min|minute)s?\s*ago', lambda m: datetime.utcnow() - timedelta(minutes=int(m.group(1)))),
+            (r'(\d+)\s*(?:hour|hr)s?\s*ago', lambda m: datetime.utcnow() - timedelta(hours=int(m.group(1)))),
+            (r'(\d+)\s*(?:day|d)s?\s*ago', lambda m: datetime.utcnow() - timedelta(days=int(m.group(1)))),
+            (r'(\d+)\s*(?:week|w)s?\s*ago', lambda m: datetime.utcnow() - timedelta(weeks=int(m.group(1)))),
+            (r'(\d+)\s*(?:month|mo)s?\s*ago', lambda m: datetime.utcnow() - timedelta(days=30*int(m.group(1)))),
+            (r'(\d+)\s*(?:year|yr)s?\s*ago', lambda m: datetime.utcnow() - timedelta(days=365*int(m.group(1)))),
+            # Also try without "ago"
+            (r'(\d+)\s*(?:min|minute)s?', lambda m: datetime.utcnow() - timedelta(minutes=int(m.group(1)))),
+            (r'(\d+)\s*(?:hour|hr)s?', lambda m: datetime.utcnow() - timedelta(hours=int(m.group(1)))),
+            (r'(\d+)\s*(?:day|d)', lambda m: datetime.utcnow() - timedelta(days=int(m.group(1)))),
+        ]
+        for pattern, calc_func in date_patterns:
+            match = re.search(pattern, elem_text, re.IGNORECASE)
+            if match:
+                try:
+                    return calc_func(match)
+                except:
+                    pass
+        
+        # Strategy 4: Look for ISO date strings in text
+        iso_match = re.search(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)', elem_text)
+        if iso_match:
+            try:
+                return datetime.fromisoformat(iso_match.group(1).replace('Z', '+00:00'))
+            except:
+                pass
+        
         return None
     
     async def _extract_people_from_posts(self, posts_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Extract people from post authors as a fallback when people page is inaccessible.
+        """Extract people from post authors, comments, and mentions as a fallback when people page is inaccessible.
         
         Note: This method only extracts basic info (name, profile_url) from posts.
         Full profile data (headline, location, profile_picture, etc.) requires visiting
@@ -2839,26 +3697,25 @@ class LinkedInScraperService:
         """
         people_dict = {}  # Use dict to deduplicate by profile_url
         
+        # Extract from post authors
         for post in posts_data:
             author_profile_url = post.get("author_profile_url")
             author_name = post.get("author_name")
             
             # Only add if we have a profile URL (required field)
             if author_profile_url and author_profile_url not in people_dict:
-                # Extract LinkedIn username from URL
-                linkedin_user_id = None
+                # Try to extract a readable name from the username if name not available
                 display_name = None
                 
-                if "/in/" in author_profile_url:
+                if "/in/" in author_profile_url and not author_name:
                     # Extract username from URL like https://in.linkedin.com/in/rajeshjaipur
                     parts = author_profile_url.split("/in/")
                     if len(parts) > 1:
                         username = parts[1].split("/")[0].split("?")[0]
-                        linkedin_user_id = username
                         
                         # Try to extract a readable name from the username
                         # Convert "rajesh-gupta-12345" -> "Rajesh Gupta"
-                        if username and not author_name:
+                        if username:
                             # Remove numbers and dashes, capitalize words
                             name_parts = username.split('-')
                             # Filter out numeric parts and convert to title case
@@ -2872,12 +3729,10 @@ class LinkedInScraperService:
                                 display_name = clean_parts[0]
                 
                 person_data = {
-                    "linkedin_user_id": linkedin_user_id,
                     "name": author_name or display_name or "Unknown",  # Prefer author_name, then extracted name, then Unknown
                     "profile_url": author_profile_url,
-                    # Note: profile_picture, headline, location, etc. require visiting the profile page
-                    # This is not done here to avoid triggering bot detection and slowing down scraping
-                    "profile_picture": None,
+                    # Note: headline, location, connection_count require visiting the profile page
+                    # This is done in _enrich_people_profiles to get full data
                     "headline": None,
                     "location": None,
                     "current_position": None,
@@ -2888,15 +3743,48 @@ class LinkedInScraperService:
                 if person_data["profile_url"]:
                     people_dict[author_profile_url] = person_data
         
+        # Also extract from comments if available
+        for post in posts_data:
+            comments = post.get("comments", [])
+            for comment in comments:
+                comment_author_url = comment.get("author_profile_url")
+                comment_author_name = comment.get("author_name")
+                if comment_author_url and comment_author_url not in people_dict:
+                    if "/in/" in comment_author_url:
+                        parts = comment_author_url.split("/in/")
+                        if len(parts) > 1:
+                            username = parts[1].split("/")[0].split("?")[0]
+                            
+                            # Derive name from username if needed
+                            display_name = None
+                            if not comment_author_name:
+                                name_parts = username.split('-')
+                                clean_parts = [p.capitalize() for p in name_parts if p and not p.isdigit() and len(p) > 1]
+                                if len(clean_parts) >= 2:
+                                    display_name = ' '.join(clean_parts[:2])
+                                elif len(clean_parts) == 1:
+                                    display_name = clean_parts[0]
+                            
+                            person_data = {
+                                "name": comment_author_name or display_name or "Unknown",
+                                "profile_url": comment_author_url,
+                                "headline": None,
+                                "location": None,
+                                "current_position": None,
+                                "connection_count": None,
+                            }
+                            if person_data["profile_url"]:
+                                people_dict[comment_author_url] = person_data
+        
         if people_dict:
-            print(f"[INFO] Extracted {len(people_dict)} people from post authors. Enriching with full profile data...")
+            print(f"[INFO] Extracted {len(people_dict)} people from posts and comments. Enriching with full profile data...")
             # Enrich with full profile data by visiting individual profiles
-            enriched_people = await self._enrich_people_profiles(list(people_dict.values()))
+            enriched_people = await self._enrich_people_profiles(list(people_dict.values()), max_profiles=50)
             return enriched_people
         
         return list(people_dict.values())
     
-    async def _enrich_people_profiles(self, people: List[Dict[str, Any]], max_profiles: int = 20) -> List[Dict[str, Any]]:
+    async def _enrich_people_profiles(self, people: List[Dict[str, Any]], max_profiles: int = 50) -> List[Dict[str, Any]]:
         """Enrich people data by visiting their LinkedIn profile pages.
         
         Args:
@@ -2932,24 +3820,35 @@ class LinkedInScraperService:
                 
                 try:
                     await page.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
-                    await page.wait_for_timeout(3000)  # Wait for content to load
+                    await page.wait_for_timeout(5000)  # Wait longer for content to load
                     
                     # Check for authwall or redirect
                     current_url = page.url
-                    if "login" in current_url.lower() or "authwall" in current_url.lower():
+                    if "login" in current_url.lower() or "authwall" in current_url.lower() or "challenge" in current_url.lower():
                         print(f"[WARNING] Cannot access profile {profile_url} - authentication required")
+                        await page.close()
                         enriched.append(person)  # Use basic data
                         continue
                     
-                    # Extract profile data using JavaScript
-                    profile_data = await page.evaluate("""
+                    # Try to wait for key elements to load - wait longer and try multiple selectors
+                    try:
+                        await page.wait_for_selector('h1, .text-heading-xlarge, [class*="headline"], .text-body-medium, .top-card-layout__headline', timeout=10000)
+                    except:
+                        pass  # Continue anyway
+                    # Extra wait for dynamic content
+                    await page.wait_for_timeout(3000)
+                    
+                    # Extract profile data using JavaScript - with better error handling
+                    try:
+                        profile_data = await page.evaluate("""
                         () => {
                             const data = {};
                             
-                            // Extract headline - try more selectors
+                            // Extract headline - try more selectors and strategies
                             const headlineSelectors = [
                                 '.text-body-medium.break-words',
                                 '.ph5.pb5 .text-body-medium.break-words',
+                                '.ph5.pb5 span.text-body-medium',
                                 '[class*="top-card-layout__headline"]',
                                 '[data-generated-suggestion-target]',
                                 '.ph5 .text-body-medium',
@@ -2957,14 +3856,20 @@ class LinkedInScraperService:
                                 '.pv-text-details__left-panel h2',
                                 'div[class*="headline"]',
                                 'span[class*="text-body-medium"]',
-                                '.top-card-layout__headline'
+                                '.top-card-layout__headline',
+                                '.pv-text-details__left-panel .text-body-medium',
+                                '.top-card__subline-item',
+                                'div[data-generated-suggestion-target]'
                             ];
                             for (const selector of headlineSelectors) {
                                 try {
                                     const elem = document.querySelector(selector);
                                     if (elem) {
                                         const text = elem.textContent ? elem.textContent.trim() : '';
-                                        if (text && text.length > 5 && text.length < 200 && !text.toLowerCase().includes('connections')) {
+                                        if (text && text.length > 5 && text.length < 200 && 
+                                            !text.toLowerCase().includes('connections') &&
+                                            !text.toLowerCase().includes('followers') &&
+                                            !text.match(/^\\d+$/)) {
                                             data.headline = text;
                                             break;
                                         }
@@ -2974,60 +3879,104 @@ class LinkedInScraperService:
                                 }
                             }
                             
-                            // Extract location - try more selectors
+                            // Fallback: Try finding headline near name
+                            if (!data.headline) {
+                                const nameElem = document.querySelector('h1, .text-heading-xlarge');
+                                if (nameElem) {
+                                    let nextSibling = nameElem.nextElementSibling;
+                                    for (let i = 0; i < 5 && nextSibling; i++) {
+                                        const text = nextSibling.textContent ? nextSibling.textContent.trim() : '';
+                                        if (text && text.length > 5 && text.length < 200) {
+                                            data.headline = text;
+                                            break;
+                                        }
+                                        nextSibling = nextSibling.nextElementSibling;
+                                    }
+                                }
+                            }
+                            
+                            // Extract location - AGGRESSIVE extraction with more selectors
                             const locationSelectors = [
                                 '.text-body-small.inline.t-black--light.break-words',
-                                '.ph5 .text-body-small',
+                                '.ph5 .text-body-small.inline',
+                                '.ph5 span.text-body-small',
                                 '[class*="top-card-layout__first-subline"]',
                                 'span[class*="location"]',
                                 '.text-body-small[class*="location"]',
                                 '.top-card-layout__first-subline',
-                                'span[class*="text-body-small"]:not([class*="headline"])'
+                                '.top-card__subline-item',
+                                'span[class*="text-body-small"]:not([class*="headline"])',
+                                '.pv-text-details__left-panel .text-body-small',
+                                '[data-test-id*="location"]',
+                                '.pv-text-details__left-panel span',
+                                '.pv-top-card-section__location',
+                                'span[class*="location"]',
+                                '.top-card__subline-item--location',
+                                '[aria-label*="location"]'
                             ];
                             for (const selector of locationSelectors) {
                                 try {
-                                    const elem = document.querySelector(selector);
-                                    if (elem) {
+                                    const elements = document.querySelectorAll(selector);
+                                    for (const elem of elements) {
                                         const text = elem.textContent ? elem.textContent.trim() : '';
-                                        if (text && text.length > 2 && text.length < 100 && 
-                                            !text.includes('connections') && 
-                                            !text.toLowerCase().includes('followers') &&
-                                            !text.match(/^\\d+$/)) {
-                                            // Likely a location if it contains common location words or commas
-                                            if (text.includes(',') || /^[A-Z][a-z]+/.test(text)) {
-                                                data.location = text;
+                                        const ariaLabel = elem.getAttribute('aria-label') || '';
+                                        
+                                        // Check both text content and aria-label
+                                        const checkText = text || ariaLabel;
+                                        
+                                        if (checkText && checkText.length > 2 && checkText.length < 100 && 
+                                            !checkText.includes('connections') && 
+                                            !checkText.toLowerCase().includes('followers') &&
+                                            !checkText.match(/^\\d+$/) &&
+                                            !checkText.toLowerCase().includes('mutual') &&
+                                            !checkText.toLowerCase().includes('profile')) {
+                                            // Likely a location if it contains common location words, commas, or location patterns
+                                            if (checkText.includes(',') || /^[A-Z][a-z]+.*[A-Z][a-z]+/.test(checkText) || 
+                                                checkText.includes('Area') || checkText.includes('Region') ||
+                                                /[A-Z][a-z]+,\\s*[A-Z]/.test(checkText)) {
+                                                data.location = checkText;
                                                 break;
                                             }
                                         }
                                     }
+                                    if (data.location) break;
                                 } catch(e) {
                                     continue;
                                 }
                             }
                             
-                            // Extract profile picture - improved selectors
-                            const imgSelectors = [
-                                'img[class*="presence-entity__image"]',
-                                'img[class*="profile-photo"]',
-                                '.pv-top-card-profile-picture__image',
-                                'img[alt*="profile"]',
-                                '.top-card-profile-picture img',
-                                'img[src*="media.licdn.com/dms/image"][src*="/profile"]'
-                            ];
-                            for (const selector of imgSelectors) {
-                                try {
-                                    const img = document.querySelector(selector);
-                                    if (img && img.src) {
-                                        const src = img.src.split('?')[0];
-                                        if (src && !src.includes('logo') && !src.includes('ghost') && !src.includes('blank')) {
-                                            data.profile_picture = src;
-                                            break;
-                                        }
+                            // Fallback: Try finding location elements by text patterns in ALL text
+                            if (!data.location) {
+                                const allSmallTexts = document.querySelectorAll('.text-body-small, span[class*="text-body-small"], p, div[class*="subline"]');
+                                for (const elem of allSmallTexts) {
+                                    const text = elem.textContent ? elem.textContent.trim() : '';
+                                    // Look for location-like patterns (City, State or City, Country)
+                                    if (text && /^[A-Z][a-z]+,\\s*[A-Z]/.test(text) && text.length < 100 &&
+                                        !text.toLowerCase().includes('connection') &&
+                                        !text.toLowerCase().includes('follower')) {
+                                        data.location = text;
+                                        break;
                                     }
-                                } catch(e) {
-                                    continue;
                                 }
                             }
+                            
+                            // Final fallback: Search entire page text for location patterns
+                            if (!data.location) {
+                                const pageText = document.body.textContent || '';
+                                const locationPatterns = [
+                                    /([A-Z][a-z]+,\\s*[A-Z][a-z]+(?:,\\s*[A-Z][a-z]+)?)/,
+                                    /([A-Z][a-z]+\\s+(?:Area|Region|District|State|Province|Country))/
+                                ];
+                                for (const pattern of locationPatterns) {
+                                    const match = pageText.match(pattern);
+                                    if (match && match[1] && match[1].length < 100) {
+                                        data.location = match[1].trim();
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            // Profile picture extraction removed per user request
                             
                             // Extract name (in case it wasn't in posts)
                             if (!data.name) {
@@ -3054,30 +4003,159 @@ class LinkedInScraperService:
                                 }
                             }
                             
+                            // Extract connection count - AGGRESSIVE extraction
+                            const connectionSelectors = [
+                                '[class*="connection"]',
+                                'span[class*="connections"]',
+                                '[aria-label*="connection"]',
+                                '.pv-top-card-v2-ctas li span',
+                                '.top-card-layout__entity-info li span',
+                                '[data-test-id*="connection"]',
+                                '.pv-top-card-v2-ctas button span',
+                                'button[aria-label*="connection"] span',
+                                '.top-card-layout__entity-info span',
+                                'li span[class*="connection"]'
+                            ];
+                            for (const selector of connectionSelectors) {
+                                try {
+                                    const elems = document.querySelectorAll(selector);
+                                    for (const elem of elems) {
+                                        const text = elem.textContent ? elem.textContent.trim() : '';
+                                        const ariaLabel = elem.getAttribute('aria-label') || '';
+                                        const parentAriaLabel = elem.parentElement ? (elem.parentElement.getAttribute('aria-label') || '') : '';
+                                        
+                                        // Check text content, aria-label, and parent aria-label
+                                        const checkText = text || ariaLabel || parentAriaLabel;
+                                        
+                                        // Look for number patterns with "connection"
+                                        const connPatterns = [
+                                            /(\\d+[,\\d]*)\\s*connections?/i,
+                                            /(\\d+[.,]?\\d*)\\s*([kKmM])\\s*connections?/i,
+                                            /connections?:\\s*(\\d+[,\\d]*)/i
+                                        ];
+                                        
+                                        for (const pattern of connPatterns) {
+                                            const connMatch = checkText.match(pattern);
+                                            if (connMatch) {
+                                                if (connMatch[2]) {
+                                                    // Has K/M suffix
+                                                    let num = parseFloat(connMatch[1].replace(/,/g, ''));
+                                                    const suffix = connMatch[2].toUpperCase();
+                                                    if (suffix === 'K') num *= 1000;
+                                                    else if (suffix === 'M') num *= 1000000;
+                                                    if (!isNaN(num) && num > 0 && num < 10000000) {
+                                                        data.connection_count = Math.floor(num);
+                                                        break;
+                                                    }
+                                                } else {
+                                                    const numStr = connMatch[1].replace(/,/g, '');
+                                                    const num = parseInt(numStr);
+                                                    if (!isNaN(num) && num > 0 && num < 10000000) {
+                                                        data.connection_count = num;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if (data.connection_count) break;
+                                    }
+                                    if (data.connection_count) break;
+                                } catch(e) {
+                                    continue;
+                                }
+                            }
+                            
+                            // Fallback: Look for connection count in text patterns in entire page
+                            if (!data.connection_count) {
+                                const allText = document.body.textContent || '';
+                                const connPatterns = [
+                                    /(\\d+[,\\d]*)\\s+connections/i,
+                                    /(\\d+[.,]?\\d*)\\s*([kKmM])\\s*connections/i,
+                                    /(\\d+[,\\d]*)\\s+connection/i,
+                                    /connections?:\\s*(\\d+[,\\d]*)/i
+                                ];
+                                for (const pattern of connPatterns) {
+                                    const match = allText.match(pattern);
+                                    if (match) {
+                                        if (match[2]) {
+                                            // Has K/M suffix
+                                            let num = parseFloat(match[1].replace(/,/g, ''));
+                                            const suffix = match[2].toUpperCase();
+                                            if (suffix === 'K') num *= 1000;
+                                            else if (suffix === 'M') num *= 1000000;
+                                            if (!isNaN(num) && num > 0 && num < 10000000) {
+                                                data.connection_count = Math.floor(num);
+                                                break;
+                                            }
+                                        } else {
+                                            const numStr = match[1].replace(/,/g, '');
+                                            const num = parseInt(numStr);
+                                            if (!isNaN(num) && num > 0 && num < 10000000) {
+                                                data.connection_count = num;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Extract current position (often same as headline, but try to find more specific position)
+                            if (!data.current_position && data.headline) {
+                                data.current_position = data.headline;
+                            } else if (!data.current_position) {
+                                // Try to find current position in experience section
+                                const expSelectors = [
+                                    '[class*="experience"] [class*="position"]',
+                                    '[class*="experience"] h3',
+                                    '.pv-profile-section__card-item h3',
+                                    '[data-section="experience"] h3'
+                                ];
+                                for (const selector of expSelectors) {
+                                    try {
+                                        const elem = document.querySelector(selector);
+                                        if (elem && elem.textContent) {
+                                            const text = elem.textContent.trim();
+                                            if (text.length > 5 && text.length < 200) {
+                                                data.current_position = text;
+                                                break;
+                                            }
+                                        }
+                                    } catch(e) {
+                                        continue;
+                                    }
+                                }
+                            }
+                            
                             return data;
                         }
                     """)
                     
-                    # Update person data with enriched fields (handle None case)
-                    if profile_data and isinstance(profile_data, dict):
-                        if profile_data.get("name"):
-                            person["name"] = profile_data["name"]
-                        if profile_data.get("headline"):
-                            person["headline"] = profile_data["headline"]
-                            person["current_position"] = profile_data["headline"]  # Use headline as position
-                        if profile_data.get("location"):
-                            person["location"] = profile_data["location"]
-                        if profile_data.get("profile_picture"):
-                            person["profile_picture"] = profile_data["profile_picture"]
-                    else:
-                        print(f"[DEBUG] Profile data extraction returned: {type(profile_data)}")
-                    
-                    print(f"[INFO] Enriched profile: {person.get('name', 'Unknown')} - {person.get('headline', 'N/A')[:50]}")
+                        # Update person data with enriched fields (handle None case)
+                        if profile_data and isinstance(profile_data, dict):
+                            # Update all available fields (excluding profile_picture and linkedin_user_id)
+                            if profile_data.get("name"):
+                                person["name"] = profile_data["name"]
+                            if profile_data.get("headline"):
+                                person["headline"] = profile_data["headline"]
+                            if profile_data.get("location"):
+                                person["location"] = profile_data["location"]
+                            if profile_data.get("current_position"):
+                                person["current_position"] = profile_data["current_position"]
+                            elif profile_data.get("headline"):  # Fallback to headline if no specific position
+                                person["current_position"] = profile_data["headline"]
+                            if profile_data.get("connection_count") is not None:
+                                person["connection_count"] = profile_data["connection_count"]
+                            
+                            print(f"[INFO] Enriched profile: {person.get('name', 'Unknown')} - Headline: {person.get('headline', 'N/A')[:50]}, Location: {person.get('location', 'N/A')}, Connections: {person.get('connection_count', 'N/A')}")
+                        else:
+                            print(f"[DEBUG] Profile data extraction returned: {type(profile_data)} for {profile_url}")
+                    except Exception as eval_error:
+                        print(f"[WARNING] Error in JavaScript evaluation for {profile_url}: {eval_error}")
                     
                 except asyncio.TimeoutError:
                     print(f"[WARNING] Timeout accessing profile {profile_url}")
                 except Exception as e:
-                    print(f"[WARNING] Error enriching profile {profile_url}: {e}")
+                    print(f"[WARNING] Error enriching profile {profile_url}: {type(e).__name__}: {str(e)}")
                 finally:
                     await page.close()
                 

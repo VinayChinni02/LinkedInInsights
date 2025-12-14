@@ -36,7 +36,6 @@ class Post(BaseModel):
     content: str = Field(..., description="Post content/text")
     author_name: Optional[str] = Field(None, description="Post author name")
     author_profile_url: Optional[str] = Field(None, description="Post author profile URL")
-    image_url: Optional[str] = Field(None, description="Post image URL")
     video_url: Optional[str] = Field(None, description="Post video URL")
     likes: Optional[int] = Field(0, description="Number of likes")
     comments_count: Optional[int] = Field(0, description="Number of comments")
@@ -60,4 +59,7 @@ class Post(BaseModel):
             }
         }
     }
+
+
+
 

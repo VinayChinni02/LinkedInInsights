@@ -86,8 +86,15 @@ class PageService:
             return None
         
         # Scrape page details
-        page_data = await scraper_service.scrape_page_details(page_id)
-        if not page_data:
+        try:
+            page_data = await scraper_service.scrape_page_details(page_id)
+            if not page_data:
+                print(f"[ERROR] Failed to scrape page details for {page_id}. scrape_page_details returned None.")
+                return None
+        except Exception as scrape_error:
+            print(f"[ERROR] Exception during scraping for {page_id}: {type(scrape_error).__name__}: {str(scrape_error)}")
+            import traceback
+            print(f"[ERROR] Traceback: {traceback.format_exc()}")
             return None
         
         # Try to enrich with LinkedIn API data if available
@@ -200,7 +207,23 @@ class PageService:
             
             # Store people
             for person_data in people_data:
+                # Ensure page_id is always set
                 person_data["page_id"] = page_db_id
+                
+                # Ensure all required fields are present (even if None)
+                # This ensures data structure consistency
+                # Note: profile_picture and linkedin_user_id removed per user request
+                required_fields = {
+                    "name": person_data.get("name", "Unknown"),
+                    "profile_url": person_data.get("profile_url"),
+                    "headline": person_data.get("headline"),
+                    "location": person_data.get("location"),
+                    "current_position": person_data.get("current_position"),
+                    "connection_count": person_data.get("connection_count"),
+                }
+                
+                # Merge with existing data
+                person_data.update(required_fields)
                 
                 # Upload profile picture if available
                 if person_data.get("profile_picture"):
@@ -208,6 +231,7 @@ class PageService:
                     pass
                 
                 await user_repository.create(person_data)
+                print(f"[INFO] Saved person: {person_data.get('name', 'Unknown')} with page_id={page_db_id}")
         except Exception as e:
             print(f"Error scraping/storing people: {e}")
     

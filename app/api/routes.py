@@ -70,9 +70,17 @@ async def get_page_details(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail=f"Scraping service is not available. Page '{page_id}' not found in database and cannot be scraped. Please check Docker logs for Playwright initialization errors."
                 )
+            
+            # More informative error message
+            error_detail = (
+                f"Page '{page_id}' not found and could not be scraped. "
+                f"This could mean: (1) The page ID is incorrect, (2) The LinkedIn page doesn't exist, "
+                f"(3) Authentication is required (configure LinkedIn credentials), or (4) LinkedIn is blocking the request. "
+                f"Check Docker logs for detailed error information."
+            )
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Page '{page_id}' not found and could not be scraped"
+                detail=error_detail
             )
         
         # Ensure all ObjectIds are converted to strings

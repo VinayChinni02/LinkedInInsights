@@ -96,3 +96,4 @@ async def general_exception_handler(
             "status_code": 500
         }
     )
+

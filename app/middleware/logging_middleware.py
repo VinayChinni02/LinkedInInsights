@@ -78,3 +78,4 @@ class LoggingMiddleware(BaseHTTPMiddleware):
                 }
             )
             raise
+

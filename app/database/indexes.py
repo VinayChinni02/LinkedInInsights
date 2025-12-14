@@ -98,3 +98,4 @@ async def create_indexes():
         print(f"[ERROR] Failed to create indexes: {e}")
         # Don't raise - allow app to continue even if indexes fail
         # Indexes can be created manually later
+
