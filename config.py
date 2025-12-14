@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     app_env: str = "development"
     debug: bool = True
     
+    # Rate Limiting Configuration
+    rate_limit_enabled: bool = True
+    rate_limit_per_minute: int = 60
+    rate_limit_per_hour: int = 1000
+    
     # Scraper Configuration
     max_posts_to_scrape: int = 20
     max_comments_per_post: int = 50

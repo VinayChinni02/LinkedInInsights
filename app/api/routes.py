@@ -78,25 +78,29 @@ async def get_page_details(
         # Ensure all ObjectIds are converted to strings
         page_data = convert_objectid_to_str(page_data)
         
-        # Check if data is limited (no authentication)
+        # Check if data is limited
         from app.services.scraper_service import scraper_service
+        from config import settings
         message = "Page retrieved successfully"
-        if not scraper_service.is_authenticated:
-            # Check if critical fields are missing
-            missing_fields = []
-            if not page_data.get("description"):
-                missing_fields.append("description")
-            if not page_data.get("total_followers"):
-                missing_fields.append("followers")
-            if not page_data.get("industry"):
-                missing_fields.append("industry")
-            if len(page_data.get("posts", [])) == 0:
-                missing_fields.append("posts")
-            if len(page_data.get("people", [])) == 0:
-                missing_fields.append("people")
-            
-            if missing_fields:
-                message = f"Page retrieved successfully. Note: Some data may be limited (missing: {', '.join(missing_fields)}). For full data access, configure LinkedIn authentication in .env file."
+        
+        # Check if critical fields are missing
+        missing_fields = []
+        if not page_data.get("industry"):
+            missing_fields.append("industry")
+        if len(page_data.get("posts", [])) == 0:
+            missing_fields.append("posts")
+        if len(page_data.get("people", [])) == 0:
+            missing_fields.append("people")
+        
+        if missing_fields:
+            # Check if credentials are configured
+            has_credentials = settings.linkedin_email and settings.linkedin_password
+            if has_credentials and not scraper_service.is_authenticated:
+                message = f"Page retrieved successfully. Note: Some data may be limited (missing: {', '.join(missing_fields)}). LinkedIn is blocking automated access despite credentials being configured. This is due to LinkedIn's bot detection."
+            elif not has_credentials:
+                message = f"Page retrieved successfully. Note: Some data may be limited (missing: {', '.join(missing_fields)}). For full data access, configure LINKEDIN_EMAIL and LINKEDIN_PASSWORD in .env file."
+            else:
+                message = f"Page retrieved successfully. Note: Some data may be limited (missing: {', '.join(missing_fields)})."
         
         return PageResponse(
             success=True,
@@ -286,11 +290,91 @@ async def refresh_page_data(page_id: str):
 
 @router.get("/health")
 async def health_check():
-    """Health check endpoint."""
-    return {
+    """
+    Comprehensive health check endpoint.
+    Checks all critical services (MongoDB, Redis, Scraper).
+    Essential for monitoring and load balancer health checks.
+    """
+    from app.database import get_database
+    from app.services.cache_service import cache_service
+    from app.services.scraper_service import scraper_service
+    
+    health_status = {
         "status": "healthy",
-        "service": "LinkedIn Insights Microservice"
+        "service": "LinkedIn Insights Microservice",
+        "version": "1.0.0",
+        "checks": {}
     }
+    
+    overall_healthy = True
+    
+    # Check MongoDB
+    try:
+        db = get_database()
+        if db:
+            await db.client.admin.command('ping')
+            health_status["checks"]["mongodb"] = {
+                "status": "healthy",
+                "message": "Connected"
+            }
+        else:
+            health_status["checks"]["mongodb"] = {
+                "status": "unhealthy",
+                "message": "Database not initialized"
+            }
+            overall_healthy = False
+    except Exception as e:
+        health_status["checks"]["mongodb"] = {
+            "status": "unhealthy",
+            "message": str(e)
+        }
+        overall_healthy = False
+    
+    # Check Redis
+    try:
+        if cache_service.redis_client:
+            await cache_service.redis_client.ping()
+            health_status["checks"]["redis"] = {
+                "status": "healthy",
+                "message": "Connected"
+            }
+        else:
+            health_status["checks"]["redis"] = {
+                "status": "degraded",
+                "message": "Cache not available (optional)"
+            }
+    except Exception as e:
+        health_status["checks"]["redis"] = {
+            "status": "degraded",
+            "message": f"Cache unavailable: {str(e)}"
+        }
+    
+    # Check Scraper Service
+    try:
+        if scraper_service.browser:
+            health_status["checks"]["scraper"] = {
+                "status": "healthy",
+                "message": "Browser initialized",
+                "authenticated": scraper_service.is_authenticated
+            }
+        else:
+            health_status["checks"]["scraper"] = {
+                "status": "degraded",
+                "message": "Scraper not available"
+            }
+    except Exception as e:
+        health_status["checks"]["scraper"] = {
+            "status": "degraded",
+            "message": f"Scraper error: {str(e)}"
+        }
+    
+    # Set overall status
+    if not overall_healthy:
+        health_status["status"] = "unhealthy"
+    
+    status_code = 200 if overall_healthy else 503
+    
+    return health_status
 
 
 @router.get("/debug/{page_id}/html")

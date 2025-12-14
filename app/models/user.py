@@ -15,7 +15,7 @@ class SocialMediaUser(BaseModel):
     page_id: Optional[PyObjectId] = Field(..., description="Reference to company page")
     linkedin_user_id: Optional[str] = Field(None, description="LinkedIn platform specific user ID")
     name: str = Field(..., description="User full name")
-    profile_url: str = Field(..., description="LinkedIn profile URL")
+    profile_url: Optional[str] = Field(None, description="LinkedIn profile URL")
     profile_picture: Optional[str] = Field(None, description="Profile picture URL")
     headline: Optional[str] = Field(None, description="User headline/title")
     location: Optional[str] = Field(None, description="User location")

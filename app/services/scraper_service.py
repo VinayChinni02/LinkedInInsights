@@ -309,14 +309,54 @@ class LinkedInScraperService:
                 return False
             
             # Wait for login form to appear - try waiting for any input field
+            # LinkedIn may have different selectors or may be blocking
+            login_form_found = False
             try:
-                await page.wait_for_selector('input[type="text"], input[type="email"], input[name="session_key"], input[id="username"]', timeout=15000)
-            except:
-                print("[WARNING] Login form not found. Checking page content...")
-                # Debug: Check what's actually on the page
-                page_content = await page.content()
-                if "bot" in page_content.lower() or "automated" in page_content.lower() or "unusual activity" in page_content.lower():
-                    print("[WARNING] LinkedIn may be blocking automated access.")
+                # Try multiple approaches to find login form
+                selectors_to_try = [
+                    'input[name="session_key"]',
+                    'input[id="username"]',
+                    'input[type="text"]',
+                    'input[type="email"]',
+                    'input[autocomplete="username"]',
+                    '#username',
+                    'input[placeholder*="Email"]',
+                    'input[placeholder*="email"]',
+                    'form',
+                    'input'
+                ]
+                
+                for selector in selectors_to_try:
+                    try:
+                        await page.wait_for_selector(selector, timeout=3000)
+                        login_form_found = True
+                        print(f"[DEBUG] Found login form element: {selector}")
+                        break
+                    except:
+                        continue
+                
+                if not login_form_found:
+                    # Check page content to understand what LinkedIn is showing
+                    page_content = await page.content()
+                    page_text = await page.evaluate("document.body.innerText")
+                    
+                    print("[WARNING] Login form not found. Checking page content...")
+                    print(f"[DEBUG] Page text sample: {page_text[:200]}")
+                    
+                    if "bot" in page_content.lower() or "automated" in page_content.lower() or "unusual activity" in page_content.lower():
+                        print("[WARNING] LinkedIn is blocking automated access.")
+                        print("[INFO] LinkedIn detects Playwright/automation. Try using fresh cookies instead.")
+                    elif "challenge" in current_url.lower() or "checkpoint" in current_url.lower():
+                        print("[WARNING] LinkedIn requires additional verification (challenge/checkpoint).")
+                        print("[INFO] This usually requires manual intervention or fresh cookies.")
+                    else:
+                        print("[WARNING] Could not find login form. LinkedIn may have changed their page structure.")
+                        print("[INFO] Try exporting fresh cookies from your browser instead.")
+                    
+                    await page.close()
+                    return False
+            except Exception as e:
+                print(f"[WARNING] Error waiting for login form: {e}")
                 await page.close()
                 return False
             
@@ -700,7 +740,359 @@ class LinkedInScraperService:
             await self.initialize()
         
         max_posts = max_posts or settings.max_posts_to_scrape
-        url = f"https://www.linkedin.com/company/{page_id}/posts/"
+        
+        # Try main page first - sometimes posts are embedded there
+        main_url = f"https://www.linkedin.com/company/{page_id}/"
+        posts_url = f"https://www.linkedin.com/company/{page_id}/posts/"
+        
+            # First, try to get posts from main page using JavaScript evaluation
+        if self.context:
+            main_page = await self.context.new_page()
+        else:
+            main_page = await self.browser.new_page()
+        
+        try:
+            # Use domcontentloaded instead of networkidle for faster loading
+            await main_page.goto(main_url, wait_until="domcontentloaded", timeout=self.timeout)
+            await main_page.wait_for_timeout(3000)  # Initial wait
+            
+            # Scroll to load more content (fewer scrolls but longer waits)
+            for _ in range(3):  # Fewer scrolls to avoid timeout
+                await main_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await main_page.wait_for_timeout(2000)  # Shorter wait to avoid timeout
+            
+            # Try to extract posts using JavaScript (bypasses some detection)
+            try:
+                js_posts = await main_page.evaluate("""
+                    () => {
+                        const posts = [];
+                        // Find all potential post elements
+                        const selectors = [
+                            '[class*="feed-shared-update"]',
+                            '[class*="update-components"]',
+                            '[class*="feed-shared"]',
+                            'article'
+                        ];
+                        
+                        for (const selector of selectors) {
+                            const elements = document.querySelectorAll(selector);
+                            for (const elem of elements) {
+                                try {
+                                    // Method 1: Look for specific post text containers
+                                    const textSelectors = [
+                                        '[class*="feed-shared-text__text-view"]',
+                                        '[class*="update-components-text"]',
+                                        '[class*="break-words"]',
+                                        '[data-test-id="post-text"]',
+                                        'span[dir="ltr"]',
+                                        'div[class*="text-view"]'
+                                    ];
+                                    
+                                    let postText = '';
+                                    let textElem = null;
+                                    
+                                    for (const textSelector of textSelectors) {
+                                        textElem = elem.querySelector(textSelector);
+                                        if (textElem) {
+                                            const text = textElem.textContent.trim();
+                                            if (text.length > 30) {
+                                                postText = text;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Method 2: Find longest meaningful text block
+                                    if (!postText || postText.length < 30) {
+                                        const allText = elem.textContent || '';
+                                        const lines = allText.split(/\\n+/)
+                                            .map(line => line.trim())
+                                            .filter(line => line.length > 30 && !line.match(/^\\d+[,\\d]*\\s+followers?$/i));
+                                        
+                                        if (lines.length > 0) {
+                                            // Get longest meaningful line (prefer non-uppercase-only)
+                                            postText = lines.reduce((a, b) => {
+                                                const aIsCaps = a.match(/^[A-Z\\s]+$/);
+                                                const bIsCaps = b.match(/^[A-Z\\s]+$/);
+                                                if (aIsCaps && !bIsCaps) return b;
+                                                if (!aIsCaps && bIsCaps) return a;
+                                                return a.length > b.length ? a : b;
+                                            });
+                                        }
+                                    }
+                                    
+                                    // Skip if content is too short
+                                    if (postText.length < 30) continue;
+                                    
+                                    // Skip if it's just company name (uppercase only, short, few words)
+                                    const isAllCaps = postText === postText.toUpperCase() && postText !== postText.toLowerCase();
+                                    if (isAllCaps && postText.length < 100 && postText.split(/\\s+/).length < 6) continue;
+                                    
+                                    // Skip if it matches company name pattern (all caps, few words)
+                                    if (postText.match(/^[A-Z\\s]+$/) && postText.split(/\\s+/).length < 8) continue;
+                                    
+                                    // Skip if it's just followers count
+                                    if (postText.match(/^[A-Za-z\\s]+\\s*\\d+[,\\d]*\\s+followers?$/i)) continue;
+                                    
+                                    // Skip if content looks like metadata only
+                                    if (postText.match(/^\\d+[wmd]\\s*(ago|edited)?$/i)) continue;
+                                    
+                                    const post = {
+                                        text: postText.substring(0, 3000),
+                                        html: elem.innerHTML.substring(0, 3000)
+                                    };
+                                    
+                                    // Try to find post URL - multiple strategies
+                                    const urlSelectors = [
+                                        'a[href*="/posts/"]',
+                                        'a[href*="/activity-"]',
+                                        'a[href*="/recent-activity/"]',
+                                        'a[href*="/feed/update/"]'
+                                    ];
+                                    for (const urlSelector of urlSelectors) {
+                                        const link = elem.querySelector(urlSelector);
+                                        if (link && link.href && link.href.includes('linkedin.com')) {
+                                            post.url = link.href.split('?')[0]; // Remove query params
+                                            break;
+                                        }
+                                    }
+                                    
+                                    // Fallback: Look for any link with post-like structure
+                                    if (!post.url) {
+                                        const allLinks = elem.querySelectorAll('a[href]');
+                                        for (const link of allLinks) {
+                                            const href = link.href || '';
+                                            if (href.includes('/posts/') || href.includes('/activity-')) {
+                                                post.url = href.split('?')[0];
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Try to find images (not logos or profile pics)
+                                    const imgs = elem.querySelectorAll('img');
+                                    for (const img of imgs) {
+                                        if (img.src && img.src.includes('media.licdn.com')) {
+                                            if (!img.src.includes('logo') && !img.src.includes('profile') && !img.src.includes('company-logo')) {
+                                                post.image = img.src;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Extract engagement metrics - multiple strategies
+                                    // Strategy 1: Check aria-labels on buttons
+                                    const buttons = elem.querySelectorAll('button[aria-label*="reaction"], button[aria-label*="like"], button[aria-label*="comment"], button[aria-label*="share"]');
+                                    for (const btn of buttons) {
+                                        const label = btn.getAttribute('aria-label') || '';
+                                        const numMatch = label.match(/(\\d+[,\\d]*)/);
+                                        if (numMatch) {
+                                            const num = parseInt(numMatch[1].replace(/,/g, ''));
+                                            const labelLower = label.toLowerCase();
+                                            if (labelLower.includes('reaction') || labelLower.includes('like')) {
+                                                post.likes = num;
+                                            } else if (labelLower.includes('comment')) {
+                                                post.comments = num;
+                                            } else if (labelLower.includes('share')) {
+                                                post.shares = num;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Strategy 2: Look for spans/divs with numbers near reaction icons
+                                    if (!post.likes) {
+                                        const reactionSpans = elem.querySelectorAll('[class*="reaction"], [class*="social-action"], [class*="engagement"]');
+                                        for (const span of reactionSpans) {
+                                            const text = span.textContent || '';
+                                            const numMatch = text.match(/(\\d+[,\\d]*)/);
+                                            if (numMatch && text.length < 50) {
+                                                const num = parseInt(numMatch[1].replace(/,/g, ''));
+                                                if (!post.likes && (text.includes('reaction') || text.includes('like') || span.classList.toString().includes('reaction'))) {
+                                                    post.likes = num;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Strategy 3: Look for comment counts in spans/buttons
+                                    if (!post.comments) {
+                                        const commentElements = elem.querySelectorAll('[class*="comment"], button[class*="comment"]');
+                                        for (const el of commentElements) {
+                                            const text = el.textContent || '';
+                                            const numMatch = text.match(/(\\d+[,\\d]*)/);
+                                            if (numMatch && text.length < 50) {
+                                                post.comments = parseInt(numMatch[1].replace(/,/g, ''));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Extract author - multiple strategies
+                                    const authorSelectors = [
+                                        'a[href*="/in/"][class*="actor"]',
+                                        '[class*="actor"] a[href*="/in/"]',
+                                        '[class*="author"] a[href*="/in/"]',
+                                        '[class*="feed-shared-actor"] a[href*="/in/"]',
+                                        'a[href*="/in/"]'
+                                    ];
+                                    for (const authorSelector of authorSelectors) {
+                                        const author = elem.querySelector(authorSelector);
+                                        if (author) {
+                                            // Try to get name from link text or nearby span
+                                            let authorText = author.textContent ? author.textContent.trim() : '';
+                                            if (!authorText || authorText.length < 2) {
+                                                const nameSpan = author.querySelector('span[class*="name"], span[dir="ltr"]');
+                                                if (nameSpan) authorText = nameSpan.textContent.trim();
+                                            }
+                                            if (authorText && authorText.length > 2 && !authorText.match(/^\\d+/) && !authorText.toLowerCase().includes('followers')) {
+                                                post.author = authorText;
+                                                post.authorUrl = author.href.split('?')[0]; // Also capture profile URL
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Extract date
+                                    const timeElem = elem.querySelector('time[datetime]');
+                                    if (timeElem) {
+                                        const datetime = timeElem.getAttribute('datetime');
+                                        if (datetime) post.created_at = datetime;
+                                    }
+                                    
+                                    // Only add if we have meaningful content
+                                    if (post.text && post.text.length > 30) {
+                                        posts.push(post);
+                                    }
+                                } catch (e) {
+                                    continue;
+                                }
+                            }
+                            if (posts.length >= 25) break;
+                        }
+                        return posts;
+                    }
+                """)
+                
+                if js_posts and len(js_posts) > 0:
+                    print(f"[INFO] Found {len(js_posts)} posts via JavaScript extraction from main page")
+                    posts = []
+                    for js_post in js_posts[:max_posts]:
+                        # Clean the post content - remove metadata and noise
+                        raw_content = js_post.get("text", "")
+                        
+                        # Skip if it's just company name
+                        if raw_content.strip().upper() == page_id.replace('-', ' ').upper():
+                            continue
+                        if len(raw_content.strip()) < 50 and raw_content.isupper():
+                            continue  # Likely just company name in caps
+                        
+                        # Remove common LinkedIn metadata patterns
+                        content_clean = re.sub(r'\d+[,\d]*\s+followers?\s*on\s+LinkedIn', '', raw_content, flags=re.IGNORECASE)
+                        content_clean = re.sub(r'\d+[,\d]*\s+followers?', '', content_clean, flags=re.IGNORECASE)
+                        content_clean = re.sub(r'\d+[wmd]\s*(ago|edited)?', '', content_clean, flags=re.IGNORECASE)
+                        # Remove company name patterns
+                        content_clean = re.sub(r'^[A-Z\s]+\s+(reposted|shared|posted)\s+this\s*', '', content_clean, flags=re.IGNORECASE)
+                        content_clean = re.sub(r'\s*\n\s*\n\s*', '\n', content_clean)  # Clean up multiple newlines
+                        content_clean = re.sub(r'\s+', ' ', content_clean).strip()
+                        
+                        # Remove if content is too short or just metadata
+                        if len(content_clean) < 30:
+                            continue
+                        
+                        # Parse created_at if available
+                        created_at = None
+                        if js_post.get("created_at"):
+                            try:
+                                # Try to parse ISO format datetime
+                                if 'T' in js_post["created_at"]:
+                                    created_at = datetime.fromisoformat(js_post["created_at"].replace('Z', '+00:00'))
+                                else:
+                                    # Try other formats
+                                    created_at = datetime.strptime(js_post["created_at"], "%Y-%m-%d %H:%M:%S")
+                            except:
+                                pass
+                        
+                        # Get engagement metrics from JavaScript extraction
+                        likes = js_post.get("likes") or 0
+                        comments_count = js_post.get("comments") or 0
+                        shares = js_post.get("shares") or 0
+                        author_name = js_post.get("author")
+                        author_url = js_post.get("authorUrl")
+                        
+                        post_data = {
+                            "content": content_clean,
+                            "post_url": js_post.get("url") or None,
+                            "image_url": js_post.get("image") or None,
+                            "author_name": author_name,
+                            "author_profile_url": author_url,
+                            "likes": int(likes) if likes else 0,
+                            "comments_count": int(comments_count) if comments_count else 0,
+                            "shares": int(shares) if shares else 0,
+                            "created_at": created_at,
+                            "comments": []
+                        }
+                        # Try to extract more details from HTML if available
+                        if js_post.get("html"):
+                            try:
+                                html_soup = BeautifulSoup(js_post["html"], 'html.parser')
+                                post_data["author_name"] = self._extract_post_author(html_soup)
+                                post_data["likes"] = self._extract_post_likes(html_soup)
+                                post_data["comments_count"] = self._extract_post_comments_count(html_soup)
+                                post_data["shares"] = self._extract_post_shares(html_soup)
+                                post_data["created_at"] = self._extract_post_date(html_soup)
+                            except Exception as e:
+                                print(f"[DEBUG] Error extracting post details from HTML: {e}")
+                                # Continue with basic data
+                        
+                        # Only add if we have meaningful content
+                        if post_data.get("content") and len(post_data.get("content", "")) > 20:
+                            posts.append(post_data)
+                    
+                    if len(posts) > 0:
+                        print(f"[INFO] Successfully extracted {len(posts)} posts from main page via JavaScript")
+                        await main_page.close()
+                        return posts
+            except Exception as e:
+                print(f"[DEBUG] JavaScript extraction failed: {e}")
+            
+            # Fallback to HTML parsing
+            main_content = await main_page.content()
+            main_soup = BeautifulSoup(main_content, 'html.parser')
+            main_posts = main_soup.find_all('div', class_=re.compile(r'feed-shared-update|update-components|feed-shared', re.I))
+            
+            if len(main_posts) >= 3:  # If we found posts on main page, use them
+                print(f"[INFO] Found {len(main_posts)} posts on main page for {page_id}, extracting...")
+                posts = []
+                for i, post_elem in enumerate(main_posts[:max_posts]):
+                    post_data = {
+                        "content": self._extract_post_content(post_elem),
+                        "author_name": self._extract_post_author(post_elem),
+                        "likes": self._extract_post_likes(post_elem),
+                        "comments_count": self._extract_post_comments_count(post_elem),
+                        "shares": self._extract_post_shares(post_elem),
+                        "post_url": self._extract_post_url(post_elem),
+                        "image_url": self._extract_post_image(post_elem),
+                        "created_at": self._extract_post_date(post_elem),
+                        "comments": []
+                    }
+                    if post_data.get("content") or post_data.get("post_url"):
+                        posts.append(post_data)
+                
+                if len(posts) > 0:
+                    print(f"[INFO] Successfully extracted {len(posts)} posts from main page")
+                    await main_page.close()
+                    return posts
+            
+            await main_page.close()
+        except Exception as e:
+            print(f"[DEBUG] Could not extract posts from main page: {e}")
+            try:
+                await main_page.close()
+            except:
+                pass
+        
+        # If main page didn't work, try dedicated posts page
+        url = posts_url
         
         # Use authenticated context if available
         if self.context:
@@ -719,54 +1111,277 @@ class LinkedInScraperService:
             # Check if we're redirected to login/authwall
             current_url = page.url
             page_title = await page.title()
-            if ("login" in current_url.lower() or 
+            page_content = await page.content()
+            
+            # More comprehensive authwall detection
+            is_authwall = (
+                "login" in current_url.lower() or 
                 "authwall" in current_url.lower() or 
                 "challenge" in current_url.lower() or
+                "checkpoint" in current_url.lower() or
                 "Sign Up" in page_title or
-                "Join LinkedIn" in page_title):
+                "Join LinkedIn" in page_title or
+                "authwall" in page_content.lower() or
+                "sign in to continue" in page_content.lower() or
+                "join linkedin" in page_content.lower()
+            )
+            
+            if is_authwall:
                 print(f"[WARNING] LinkedIn requires authentication to view posts for {page_id}")
+                print(f"[DEBUG] Current URL: {current_url}, Title: {page_title[:100]}")
+                
+                # If we thought we were authenticated but got authwall, update status
+                if self.is_authenticated:
+                    print("[INFO] Authentication appears invalid. Attempting to re-authenticate...")
+                    self.is_authenticated = False
+                    # Try to login if credentials are available
+                    if settings.linkedin_email and settings.linkedin_password:
+                        print(f"[INFO] Attempting login with credentials: {settings.linkedin_email[:3]}***")
+                        login_success = await self._login()
+                        if login_success:
+                            self.is_authenticated = True
+                            print("[INFO] Re-authentication successful. Retrying posts scrape...")
+                            await page.close()
+                            # Retry with authenticated session
+                            return await self.scrape_posts(page_id, max_posts)
+                        else:
+                            print("[WARNING] Re-authentication failed. Cannot access posts without valid session.")
+                    else:
+                        print("[WARNING] No credentials available for re-authentication.")
+                else:
+                    # Not authenticated, try login if credentials available
+                    if settings.linkedin_email and settings.linkedin_password:
+                        print(f"[INFO] Not authenticated. Attempting login with credentials: {settings.linkedin_email[:3]}***")
+                        login_success = await self._login()
+                        if login_success:
+                            self.is_authenticated = True
+                            print("[INFO] Login successful. Retrying posts scrape...")
+                            await page.close()
+                            return await self.scrape_posts(page_id, max_posts)
+                
                 await page.close()
                 return []
             
+            # Wait for posts to load initially (LinkedIn loads posts dynamically)
+            print(f"[DEBUG] Waiting for posts to load on {url}...")
+            await page.wait_for_timeout(5000)  # Initial wait for content
+            
             # Scroll more aggressively to load posts (15-25 posts requirement)
-            scroll_count = 8 if self.is_authenticated else 5
+            scroll_count = 10 if self.is_authenticated else 6
             posts_found = 0
             
             for scroll_iteration in range(scroll_count):
-                # Scroll down
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(3000)  # Wait longer for content to load
+                # Scroll down gradually (more natural)
+                await page.evaluate("window.scrollBy(0, 500)")
+                await page.wait_for_timeout(2000)
+                await page.evaluate("window.scrollBy(0, 500)")
+                await page.wait_for_timeout(2000)
                 
-                # Check how many posts we have
+                # Check how many posts we have using multiple methods
                 current_content = await page.content()
                 current_soup = BeautifulSoup(current_content, 'html.parser')
-                current_posts = current_soup.find_all('div', class_=re.compile(r'feed-shared-update|update-components', re.I))
+                
+                # Try multiple selectors
+                current_posts = current_soup.find_all('div', class_=re.compile(r'feed-shared-update|update-components|feed-shared', re.I))
+                
+                # Also try article tags
+                if len(current_posts) == 0:
+                    current_posts = current_soup.find_all('article')
+                
+                # Try data attributes
+                if len(current_posts) == 0:
+                    current_posts = current_soup.find_all('div', {'data-test-id': re.compile(r'post|update|feed', re.I)})
+                
+                print(f"[DEBUG] Scroll {scroll_iteration + 1}/{scroll_count}: Found {len(current_posts)} post elements")
                 
                 if len(current_posts) >= max_posts:
                     posts_found = len(current_posts)
+                    print(f"[DEBUG] Found enough posts ({posts_found}), stopping scroll")
                     break
                 
                 # Try clicking "Show more" or "Load more" if available
                 try:
-                    show_more_button = page.locator('button:has-text("Show more"), button:has-text("Load more"), button:has-text("See more")').first
-                    if await show_more_button.is_visible():
+                    show_more_button = page.locator('button:has-text("Show more"), button:has-text("Load more"), button:has-text("See more"), button:has-text("Show more posts")').first
+                    if await show_more_button.is_visible(timeout=2000):
                         await show_more_button.click()
-                        await page.wait_for_timeout(2000)
+                        await page.wait_for_timeout(3000)
+                        print("[DEBUG] Clicked 'Show more' button")
                 except:
                     pass
+                
+                # Try clicking "See more updates" or similar
+                try:
+                    see_more = page.locator('button:has-text("See more updates"), span:has-text("See more")').first
+                    if await see_more.is_visible(timeout=2000):
+                        await see_more.click()
+                        await page.wait_for_timeout(3000)
+                        print("[DEBUG] Clicked 'See more updates'")
+                except:
+                    pass
+            
+            # Final wait for any lazy-loaded content
+            await page.wait_for_timeout(3000)
             
             content = await page.content()
             soup = BeautifulSoup(content, 'html.parser')
             
-            # Extract posts with multiple selector patterns
-            post_elements = soup.find_all('div', class_=re.compile(r'feed-shared-update|update-components|feed-shared', re.I))
+            # Extract posts with multiple selector patterns (more comprehensive)
+            post_elements = []
             
-            # Also try alternative selectors
+            # Method 1: Class-based selectors
+            post_elements.extend(soup.find_all('div', class_=re.compile(r'feed-shared-update|update-components|feed-shared', re.I)))
+            
+            # Method 2: Article tags
             if len(post_elements) < max_posts:
-                alt_elements = soup.find_all('article') + soup.find_all('div', {'data-test-id': re.compile(r'post|update', re.I)})
-                post_elements.extend(alt_elements)
+                articles = soup.find_all('article')
+                print(f"[DEBUG] Found {len(articles)} article elements")
+                post_elements.extend(articles)
+            
+            # Method 3: Data attributes
+            if len(post_elements) < max_posts:
+                data_posts = soup.find_all('div', {'data-test-id': re.compile(r'post|update|feed|activity', re.I)})
+                print(f"[DEBUG] Found {len(data_posts)} elements with post-related data-test-id")
+                post_elements.extend(data_posts)
+            
+            # Method 4: ID-based
+            if len(post_elements) < max_posts:
+                id_posts = soup.find_all('div', id=re.compile(r'post|update|feed', re.I))
+                post_elements.extend(id_posts)
+            
+            # Method 5: Look for specific LinkedIn post structure
+            if len(post_elements) < max_posts:
+                # Look for divs containing post-like content
+                all_divs = soup.find_all('div')
+                for div in all_divs:
+                    div_text = div.get_text().lower()
+                    div_class = ' '.join(div.get('class', []))
+                    # Check if it looks like a post (has engagement metrics or post-like structure)
+                    if any(keyword in div_text for keyword in ['like', 'comment', 'share', 'repost']) or \
+                       any(keyword in div_class.lower() for keyword in ['feed', 'update', 'post', 'activity']):
+                        if div not in post_elements:
+                            post_elements.append(div)
+            
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_posts = []
+            for post in post_elements:
+                post_id = id(post)
+                if post_id not in seen:
+                    seen.add(post_id)
+                    unique_posts.append(post)
+            post_elements = unique_posts
+            
+            # Try extracting from JSON data in script tags (LinkedIn often embeds data here)
+            if len(post_elements) < max_posts:
+                # Method 1: Look for JSON-LD structured data
+                script_tags = soup.find_all('script', type='application/ld+json')
+                for script in script_tags:
+                    try:
+                        import json
+                        data = json.loads(script.string)
+                        # Look for post data in JSON-LD
+                        if isinstance(data, dict) and 'itemListElement' in data:
+                            print(f"[DEBUG] Found structured data in JSON-LD for posts")
+                    except:
+                        pass
+                
+                # Method 2: Extract from inline JSON in script tags (LinkedIn embeds data here)
+                all_scripts = soup.find_all('script')
+                for script in all_scripts:
+                    if script.string:
+                        script_text = script.string
+                        # Look for LinkedIn's internal data structures
+                        if 'feedUpdates' in script_text or 'elements' in script_text or 'posts' in script_text:
+                            try:
+                                # Try to extract JSON objects
+                                import json
+                                # Look for JSON objects in the script
+                                json_matches = re.findall(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', script_text)
+                                for match in json_matches[:5]:  # Limit to avoid too much processing
+                                    try:
+                                        data = json.loads(match)
+                                        if isinstance(data, dict):
+                                            # Look for post-like structures
+                                            if 'text' in data or 'content' in data or 'update' in str(data).lower():
+                                                print(f"[DEBUG] Found potential post data in script JSON")
+                                    except:
+                                        continue
+                            except:
+                                pass
+                
+                # Method 3: Try to intercept network responses (if page is still open)
+                try:
+                    # Use Playwright to evaluate JavaScript and extract data from page's memory
+                    if page and not page.is_closed():
+                        # Try to get data from LinkedIn's internal state
+                        page_data_js = await page.evaluate("""
+                            () => {
+                                // Try to access LinkedIn's internal data structures
+                                const data = {};
+                                // Look for window.__INITIAL_STATE__ or similar
+                                if (window.__INITIAL_STATE__) {
+                                    data.initialState = window.__INITIAL_STATE__;
+                                }
+                                // Look for feed data
+                                if (window.feedUpdates) {
+                                    data.feedUpdates = window.feedUpdates;
+                                }
+                                // Try to find post elements via DOM
+                                const postDivs = document.querySelectorAll('[class*="feed-shared"], [class*="update-components"], article');
+                                data.postCount = postDivs.length;
+                                return data;
+                            }
+                        """)
+                        if page_data_js and page_data_js.get('postCount', 0) > 0:
+                            print(f"[DEBUG] Found {page_data_js.get('postCount')} posts via JavaScript evaluation")
+                except Exception as e:
+                    print(f"[DEBUG] Could not extract via JavaScript: {e}")
+                
+                # Method 4: Look for posts in inline JSON patterns
+                json_patterns = [
+                    r'"feedUpdates":\s*\[(.*?)\]',
+                    r'"elements":\s*\[(.*?)\]',
+                    r'"posts":\s*\[(.*?)\]',
+                    r'"updates":\s*\[(.*?)\]',
+                ]
+                for pattern in json_patterns:
+                    matches = re.findall(pattern, content, re.DOTALL)
+                    if matches:
+                        print(f"[DEBUG] Found potential post data in JSON pattern: {pattern[:20]}...")
             
             print(f"[DEBUG] Found {len(post_elements)} post elements for {page_id}, extracting up to {max_posts}")
+            
+            # If no posts found, check if page content suggests posts exist
+            if len(post_elements) == 0:
+                page_text = soup.get_text().lower()
+                page_html_sample = content[:2000]  # First 2000 chars
+                
+                print(f"[WARNING] No posts found for {page_id}")
+                print(f"[DEBUG] Page text sample: {page_text[:500]}")
+                print(f"[DEBUG] Page HTML sample: {page_html_sample}")
+                
+                # Check what LinkedIn is actually showing
+                if 'post' in page_text or 'update' in page_text or 'share' in page_text:
+                    print(f"[WARNING] Page suggests posts exist but none extracted. This may indicate:")
+                    print(f"[WARNING] 1. LinkedIn HTML structure changed (selectors outdated)")
+                    print(f"[WARNING] 2. Posts are loaded via JavaScript and need more wait time")
+                    print(f"[WARNING] 3. Authentication issue (even with cookies)")
+                    print(f"[WARNING] 4. LinkedIn is showing a different page structure")
+                
+                # Try to detect if we're on the right page
+                if '/posts/' not in current_url:
+                    print(f"[WARNING] Not on posts page! Current URL: {current_url}")
+                elif 'feed' in current_url.lower() or 'activity' in current_url.lower():
+                    print(f"[INFO] On feed/activity page, which should have posts")
+                
+                # Save HTML for debugging
+                try:
+                    debug_file = f"/tmp/linkedin_posts_debug_{page_id}.html"
+                    with open(debug_file, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    print(f"[DEBUG] Saved HTML to {debug_file} for inspection")
+                except:
+                    pass
             
             for i, post_elem in enumerate(post_elements[:max_posts]):
                 if i >= max_posts:
@@ -819,7 +1434,122 @@ class LinkedInScraperService:
         if not self.browser:
             await self.initialize()
         
-        url = f"https://www.linkedin.com/company/{page_id}/people/"
+        people_url = f"https://www.linkedin.com/company/{page_id}/people/"
+        main_url = f"https://www.linkedin.com/company/{page_id}/"
+        
+        # First, try to get people from main page using JavaScript extraction
+        if self.context:
+            main_page = await self.context.new_page()
+        else:
+            main_page = await self.browser.new_page()
+        
+        try:
+            await main_page.goto(main_url, wait_until="domcontentloaded", timeout=self.timeout)
+            await main_page.wait_for_timeout(3000)
+            
+            # Scroll to load content
+            for _ in range(3):
+                await main_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await main_page.wait_for_timeout(2000)
+            
+            # Try JavaScript extraction for people
+            try:
+                js_people = await main_page.evaluate("""
+                    () => {
+                        const people = [];
+                        // Look for people/employee elements
+                        const selectors = [
+                            '[class*="entity-result"]',
+                            '[class*="search-result"]',
+                            '[class*="people"]',
+                            '[class*="employee"]',
+                            '[class*="member"]',
+                            'li[class*="people"]'
+                        ];
+                        
+                        for (const selector of selectors) {
+                            const elements = document.querySelectorAll(selector);
+                            for (const elem of elements) {
+                                const text = elem.textContent.trim();
+                                // Skip job listings
+                                if (text.toLowerCase().includes('jobs') || text.toLowerCase().includes('job opening')) continue;
+                                
+                                if (text.length > 20 && text.length < 500) {
+                                    // Try to find profile link first (must have /in/ to be a real person)
+                                    const link = elem.querySelector('a[href*="/in/"]');
+                                    if (!link) continue;  // Skip if no profile link
+                                    
+                                    const person = { text: text, url: link.href };
+                                    
+                                    // Try to find name
+                                    const nameElem = elem.querySelector('[class*="name"], h3, h2, a[href*="/in/"]');
+                                    if (nameElem) {
+                                        person.name = nameElem.textContent.trim();
+                                        // Skip if name contains "jobs" or is too generic
+                                        if (person.name.toLowerCase().includes('jobs') || person.name.toLowerCase().includes('job')) continue;
+                                    }
+                                    
+                                    // Try to find headline/title
+                                    const headlineElem = elem.querySelector('[class*="headline"], [class*="subline"], [class*="title"]');
+                                    if (headlineElem) person.headline = headlineElem.textContent.trim();
+                                    
+                                    // Try to find profile picture
+                                    const img = elem.querySelector('img');
+                                    if (img && img.src && !img.src.includes('logo') && !img.src.includes('job')) {
+                                        person.image = img.src;
+                                    }
+                                    
+                                    // Only add if we have a name and URL
+                                    if (person.name && person.url) {
+                                        people.push(person);
+                                    }
+                                }
+                            }
+                            if (people.length >= 50) break;
+                        }
+                        return people;
+                    }
+                """)
+                
+                if js_people and len(js_people) > 0:
+                    print(f"[INFO] Found {len(js_people)} people via JavaScript extraction from main page")
+                    people = []
+                    for js_person in js_people[:100]:
+                        person_data = {
+                            "name": js_person.get("name") or js_person.get("text", "").split("\n")[0],
+                            "profile_url": js_person.get("url"),
+                            "headline": js_person.get("headline"),
+                            "location": None,
+                            "current_position": js_person.get("headline"),
+                            "profile_picture": js_person.get("image"),
+                        }
+                        
+                        if person_data.get("name") and len(person_data["name"]) > 2:
+                            people.append(person_data)
+                    
+                    if len(people) > 0:
+                        print(f"[INFO] Successfully extracted {len(people)} people from main page via JavaScript")
+                        await main_page.close()
+                        return people
+            except Exception as e:
+                print(f"[DEBUG] JavaScript people extraction failed: {e}")
+            
+            await main_page.close()
+        except asyncio.TimeoutError:
+            print(f"[DEBUG] Timeout extracting people from main page")
+            try:
+                await main_page.close()
+            except:
+                pass
+        except Exception as e:
+            print(f"[DEBUG] Could not extract people from main page: {e}")
+            try:
+                await main_page.close()
+            except:
+                pass
+        
+        # If main page didn't work, try dedicated people page
+        url = people_url
         
         # Use authenticated context if available
         if self.context:
@@ -832,18 +1562,60 @@ class LinkedInScraperService:
         people = []
         
         try:
-            await page.goto(url, wait_until="networkidle", timeout=self.timeout)
-            await page.wait_for_timeout(5000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
+            await page.wait_for_timeout(3000)
             
             # Check if we're redirected to login/authwall
             current_url = page.url
             page_title = await page.title()
-            if ("login" in current_url.lower() or 
+            page_content = await page.content()
+            
+            # More comprehensive authwall detection
+            is_authwall = (
+                "login" in current_url.lower() or 
                 "authwall" in current_url.lower() or 
                 "challenge" in current_url.lower() or
+                "checkpoint" in current_url.lower() or
                 "Sign Up" in page_title or
-                "Join LinkedIn" in page_title):
+                "Join LinkedIn" in page_title or
+                "authwall" in page_content.lower() or
+                "sign in to continue" in page_content.lower() or
+                "join linkedin" in page_content.lower()
+            )
+            
+            if is_authwall:
                 print(f"[WARNING] LinkedIn requires authentication to view people for {page_id}")
+                print(f"[DEBUG] Current URL: {current_url}, Title: {page_title[:100]}")
+                
+                # If we thought we were authenticated but got authwall, update status
+                if self.is_authenticated:
+                    print("[INFO] Authentication appears invalid. Attempting to re-authenticate...")
+                    self.is_authenticated = False
+                    # Try to login if credentials are available
+                    if settings.linkedin_email and settings.linkedin_password:
+                        print(f"[INFO] Attempting login with credentials: {settings.linkedin_email[:3]}***")
+                        login_success = await self._login()
+                        if login_success:
+                            self.is_authenticated = True
+                            print("[INFO] Re-authentication successful. Retrying people scrape...")
+                            await page.close()
+                            # Retry with authenticated session
+                            return await self.scrape_people(page_id)
+                        else:
+                            print("[WARNING] Re-authentication failed. Cannot access people without valid session.")
+                    else:
+                        print("[WARNING] No credentials available for re-authentication.")
+                else:
+                    # Not authenticated, try login if credentials available
+                    if settings.linkedin_email and settings.linkedin_password:
+                        print(f"[INFO] Not authenticated. Attempting login with credentials: {settings.linkedin_email[:3]}***")
+                        login_success = await self._login()
+                        if login_success:
+                            self.is_authenticated = True
+                            print("[INFO] Login successful. Retrying people scrape...")
+                            await page.close()
+                            return await self.scrape_people(page_id)
+                
                 await page.close()
                 return []
             
@@ -885,7 +1657,26 @@ class LinkedInScraperService:
                 alt_elements = soup.find_all('li', class_=re.compile(r'people|employee|member', re.I))
                 people_elements.extend(alt_elements)
             
+            # Try extracting from structured data
+            if len(people_elements) < 20:
+                # Look for people in JSON data
+                script_tags = soup.find_all('script', type='application/ld+json')
+                for script in script_tags:
+                    try:
+                        import json
+                        data = json.loads(script.string)
+                        if isinstance(data, dict) and 'employee' in data:
+                            print(f"[DEBUG] Found employee data in JSON-LD")
+                    except:
+                        pass
+            
             print(f"[DEBUG] Found {len(people_elements)} people elements for {page_id}")
+            
+            # If no people found, check if page content suggests people exist
+            if len(people_elements) == 0:
+                page_text = soup.get_text().lower()
+                if 'employee' in page_text or 'people' in page_text or 'member' in page_text:
+                    print(f"[WARNING] Page suggests people exist but none extracted. This may indicate authentication or selector issues.")
             
             for person_elem in people_elements[:100]:  # Limit to 100 people
                 person_data = {
@@ -1754,7 +2545,7 @@ class LinkedInScraperService:
             '.social-actions-button__comment-count',
             '[data-test-id="social-actions__comments-count"]',
             'button[aria-label*="comment"]',
-            'span:has-text("comment")',
+            # Note: :has-text() is Playwright-only, not supported in BeautifulSoup
         ]
         for selector in selectors:
             comments = elem.select_one(selector)
