@@ -929,25 +929,76 @@ class LinkedInScraperService:
                                     
                                     // Extract author - multiple strategies
                                     const authorSelectors = [
-                                        'a[href*="/in/"][class*="actor"]',
+                                        '[class*="feed-shared-actor"] a[href*="/in/"]',
+                                        '[class*="feed-shared-actor__name"]',
+                                        '[class*="update-components-actor"] a[href*="/in/"]',
                                         '[class*="actor"] a[href*="/in/"]',
                                         '[class*="author"] a[href*="/in/"]',
-                                        '[class*="feed-shared-actor"] a[href*="/in/"]',
+                                        'a[href*="/in/"][class*="actor"]',
                                         'a[href*="/in/"]'
                                     ];
+                                    
                                     for (const authorSelector of authorSelectors) {
                                         const author = elem.querySelector(authorSelector);
                                         if (author) {
                                             // Try to get name from link text or nearby span
                                             let authorText = author.textContent ? author.textContent.trim() : '';
+                                            
+                                            // If no text in link, look for nearby span with name
                                             if (!authorText || authorText.length < 2) {
-                                                const nameSpan = author.querySelector('span[class*="name"], span[dir="ltr"]');
-                                                if (nameSpan) authorText = nameSpan.textContent.trim();
+                                                // Look for name in parent/ancestor
+                                                let parent = author.parentElement;
+                                                for (let i = 0; i < 3 && parent; i++) {
+                                                    const nameSpan = parent.querySelector('span[class*="name"], span[dir="ltr"], span[aria-hidden="true"]');
+                                                    if (nameSpan && nameSpan.textContent) {
+                                                        const text = nameSpan.textContent.trim();
+                                                        if (text.length > 2 && text.length < 100) {
+                                                            authorText = text;
+                                                            break;
+                                                        }
+                                                    }
+                                                    parent = parent.parentElement;
+                                                }
                                             }
-                                            if (authorText && authorText.length > 2 && !authorText.match(/^\\d+/) && !authorText.toLowerCase().includes('followers')) {
+                                            
+                                            // Also check aria-label for name
+                                            if ((!authorText || authorText.length < 2) && author.getAttribute('aria-label')) {
+                                                const ariaLabel = author.getAttribute('aria-label');
+                                                if (ariaLabel && !ariaLabel.toLowerCase().includes('profile') && ariaLabel.length < 100) {
+                                                    authorText = ariaLabel.trim();
+                                                }
+                                            }
+                                            
+                                            // Validate and set
+                                            if (authorText && authorText.length > 2 && authorText.length < 100 && 
+                                                !authorText.match(/^\\d+$/) && 
+                                                !authorText.toLowerCase().includes('followers') &&
+                                                !authorText.toLowerCase().includes('view profile')) {
                                                 post.author = authorText;
                                                 post.authorUrl = author.href.split('?')[0]; // Also capture profile URL
                                                 break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Fallback: Try to find any link with /in/ and get name from nearby text
+                                    if (!post.author) {
+                                        const profileLinks = elem.querySelectorAll('a[href*="/in/"]');
+                                        for (const link of profileLinks) {
+                                            const href = link.href || '';
+                                            if (href.includes('/in/')) {
+                                                // Look for name in the same container
+                                                let container = link.closest('[class*="actor"], [class*="author"], [class*="feed"]');
+                                                if (container) {
+                                                    const allText = container.textContent || '';
+                                                    // Try to extract a name-like pattern (2-4 words, starts with capital)
+                                                    const nameMatch = allText.match(/^([A-Z][a-z]+(?:\\s+[A-Z][a-z]+){1,3})/);
+                                                    if (nameMatch && nameMatch[1].length > 3 && nameMatch[1].length < 50) {
+                                                        post.author = nameMatch[1];
+                                                        post.authorUrl = href.split('?')[0];
+                                                        break;
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -1617,10 +1668,150 @@ class LinkedInScraperService:
                             return await self.scrape_people(page_id)
                 
                 await page.close()
+                
+                # Fallback: Try to extract people from posts (post authors)
+                print("[INFO] Attempting to extract people from post authors as fallback...")
+                try:
+                    posts_data = await self.scrape_posts(page_id, max_posts=50)
+                    if posts_data:
+                        people_from_posts = await self._extract_people_from_posts(posts_data)
+                        if people_from_posts:
+                            print(f"[INFO] Extracted {len(people_from_posts)} people from post authors")
+                            return people_from_posts
+                except Exception as e:
+                    print(f"[DEBUG] Failed to extract people from posts: {e}")
+                
                 return []
             
+            # Try JavaScript extraction first for better results
+            try:
+                js_people = await page.evaluate("""
+                    () => {
+                        const people = [];
+                        // Look for people cards/items - LinkedIn people page uses these classes
+                        const selectors = [
+                            '[class*="org-people-profile-card"]',
+                            '[class*="entity-result"]',
+                            '[class*="search-result"]',
+                            '[class*="reusable-search"]',
+                            '[class*="org-people-profiles-module"]',
+                            'li[class*="people"]',
+                            'div[class*="people-card"]'
+                        ];
+                        
+                        for (const selector of selectors) {
+                            const elements = document.querySelectorAll(selector);
+                            for (const elem of elements) {
+                                try {
+                                    // Must have a profile link to be valid
+                                    const profileLink = elem.querySelector('a[href*="/in/"]');
+                                    if (!profileLink || !profileLink.href) continue;
+                                    
+                                    const person = { url: profileLink.href };
+                                    
+                                    // Extract name - try multiple approaches
+                                    const nameSelectors = [
+                                        'a[href*="/in/"] span[aria-hidden="true"]',
+                                        'a[href*="/in/"]',
+                                        '[class*="entity-result__title"]',
+                                        '[class*="name"]',
+                                        'h3',
+                                        'h2'
+                                    ];
+                                    for (const nameSelector of nameSelectors) {
+                                        const nameElem = elem.querySelector(nameSelector);
+                                        if (nameElem && nameElem.textContent) {
+                                            const name = nameElem.textContent.trim();
+                                            // Skip if it looks like metadata
+                                            if (name.length > 2 && name.length < 100 && !name.match(/^\\d+$/) && !name.toLowerCase().includes('view profile')) {
+                                                person.name = name;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Extract headline/position
+                                    const headlineSelectors = [
+                                        '[class*="entity-result__primary-subtitle"]',
+                                        '[class*="headline"]',
+                                        '[class*="subline"]',
+                                        '[class*="position"]',
+                                        'p[class*="subtitle"]'
+                                    ];
+                                    for (const headlineSelector of headlineSelectors) {
+                                        const headlineElem = elem.querySelector(headlineSelector);
+                                        if (headlineElem && headlineElem.textContent) {
+                                            const headline = headlineElem.textContent.trim();
+                                            if (headline.length > 5 && !headline.toLowerCase().includes('job')) {
+                                                person.headline = headline;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Extract location
+                                    const locationSelectors = [
+                                        '[class*="entity-result__secondary-subtitle"]',
+                                        '[class*="location"]',
+                                        'span[class*="location"]'
+                                    ];
+                                    for (const locationSelector of locationSelectors) {
+                                        const locationElem = elem.querySelector(locationSelector);
+                                        if (locationElem && locationElem.textContent) {
+                                            const location = locationElem.textContent.trim();
+                                            if (location.length > 2 && location.length < 100) {
+                                                person.location = location;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Extract profile picture
+                                    const img = elem.querySelector('img[class*="presence-entity"], img[class*="entity-result__universal-image"], img[class*="profile-photo"]');
+                                    if (img && img.src && !img.src.includes('logo') && !img.src.includes('ghost') && !img.src.includes('blank')) {
+                                        person.image = img.src;
+                                    }
+                                    
+                                    // Only add if we have name and URL
+                                    if (person.name && person.url) {
+                                        people.push(person);
+                                    }
+                                } catch (e) {
+                                    continue;
+                                }
+                            }
+                            if (people.length >= 50) break;
+                        }
+                        return people;
+                    }
+                """)
+                
+                if js_people and len(js_people) > 0:
+                    print(f"[INFO] Found {len(js_people)} people via JavaScript extraction from people page")
+                    people = []
+                    for js_person in js_people[:100]:
+                        person_data = {
+                            "name": js_person.get("name", "").strip(),
+                            "profile_url": js_person.get("url"),
+                            "headline": js_person.get("headline"),
+                            "location": js_person.get("location"),
+                            "current_position": js_person.get("headline"),  # Use headline as position
+                            "profile_picture": js_person.get("image"),
+                        }
+                        
+                        if person_data.get("name") and len(person_data["name"]) > 2:
+                            people.append(person_data)
+                    
+                    if len(people) > 0:
+                        print(f"[INFO] Successfully extracted {len(people)} people from people page via JavaScript")
+                        await page.close()
+                        return people
+            except Exception as e:
+                print(f"[DEBUG] JavaScript people extraction from people page failed: {e}")
+            
+            # Fallback to HTML extraction
             # Scroll more aggressively to load people
-            scroll_count = 6 if self.is_authenticated else 4
+            scroll_count = 8 if self.is_authenticated else 6
             people_found = 0
             
             for scroll_iteration in range(scroll_count):
@@ -1628,21 +1819,36 @@ class LinkedInScraperService:
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(3000)
                 
-                # Check how many people we have
-                current_content = await page.content()
-                current_soup = BeautifulSoup(current_content, 'html.parser')
-                current_people = current_soup.find_all('div', class_=re.compile(r'entity-result|search-result|reusable-search', re.I))
-                
-                if len(current_people) >= 50:
-                    people_found = len(current_people)
-                    break
-                
-                # Try clicking "Show more" if available
+                # Try clicking "Show more" or "See more people" if available
                 try:
-                    show_more_button = page.locator('button:has-text("Show more"), button:has-text("See more people")').first
-                    if await show_more_button.is_visible():
-                        await show_more_button.click()
-                        await page.wait_for_timeout(2000)
+                    show_more_selectors = [
+                        'button:has-text("Show more")',
+                        'button:has-text("See more people")',
+                        'button[aria-label*="Show more"]',
+                        'button[class*="show-more"]'
+                    ]
+                    for selector in show_more_selectors:
+                        try:
+                            show_more_button = page.locator(selector).first
+                            if await show_more_button.is_visible(timeout=1000):
+                                await show_more_button.click()
+                                await page.wait_for_timeout(2000)
+                                break
+                        except:
+                            continue
+                except:
+                    pass
+                
+                # Check how many people we have
+                try:
+                    current_count = await page.evaluate("""
+                        () => {
+                            return document.querySelectorAll('a[href*="/in/"]').length;
+                        }
+                    """)
+                    if current_count >= 50:
+                        people_found = current_count
+                        break
                 except:
                     pass
             
@@ -1650,12 +1856,17 @@ class LinkedInScraperService:
             soup = BeautifulSoup(content, 'html.parser')
             
             # Extract people with multiple selector patterns
-            people_elements = soup.find_all('div', class_=re.compile(r'entity-result|search-result|reusable-search|org-people-profile-card', re.I))
+            people_elements = soup.find_all('div', class_=re.compile(r'entity-result|search-result|reusable-search|org-people-profile-card|org-people-profiles', re.I))
             
             # Also try alternative selectors
             if len(people_elements) < 20:
                 alt_elements = soup.find_all('li', class_=re.compile(r'people|employee|member', re.I))
                 people_elements.extend(alt_elements)
+            
+            # Also look for any div containing profile links
+            if len(people_elements) < 20:
+                profile_link_containers = soup.find_all('div', class_=lambda x: x and ('people' in x.lower() or 'member' in x.lower() or 'employee' in x.lower()))
+                people_elements.extend(profile_link_containers)
             
             # Try extracting from structured data
             if len(people_elements) < 20:
@@ -2618,6 +2829,269 @@ class LinkedInScraperService:
                 except:
                     pass
         return None
+    
+    async def _extract_people_from_posts(self, posts_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Extract people from post authors as a fallback when people page is inaccessible.
+        
+        Note: This method only extracts basic info (name, profile_url) from posts.
+        Full profile data (headline, location, profile_picture, etc.) requires visiting
+        individual profile pages, which is slow and may trigger bot detection.
+        """
+        people_dict = {}  # Use dict to deduplicate by profile_url
+        
+        for post in posts_data:
+            author_profile_url = post.get("author_profile_url")
+            author_name = post.get("author_name")
+            
+            # Only add if we have a profile URL (required field)
+            if author_profile_url and author_profile_url not in people_dict:
+                # Extract LinkedIn username from URL
+                linkedin_user_id = None
+                display_name = None
+                
+                if "/in/" in author_profile_url:
+                    # Extract username from URL like https://in.linkedin.com/in/rajeshjaipur
+                    parts = author_profile_url.split("/in/")
+                    if len(parts) > 1:
+                        username = parts[1].split("/")[0].split("?")[0]
+                        linkedin_user_id = username
+                        
+                        # Try to extract a readable name from the username
+                        # Convert "rajesh-gupta-12345" -> "Rajesh Gupta"
+                        if username and not author_name:
+                            # Remove numbers and dashes, capitalize words
+                            name_parts = username.split('-')
+                            # Filter out numeric parts and convert to title case
+                            clean_parts = []
+                            for part in name_parts:
+                                if part and not part.isdigit() and len(part) > 1:
+                                    clean_parts.append(part.capitalize())
+                            if len(clean_parts) >= 2:  # At least first and last name
+                                display_name = ' '.join(clean_parts[:2])  # Use first 2 parts (first + last name)
+                            elif len(clean_parts) == 1:
+                                display_name = clean_parts[0]
+                
+                person_data = {
+                    "linkedin_user_id": linkedin_user_id,
+                    "name": author_name or display_name or "Unknown",  # Prefer author_name, then extracted name, then Unknown
+                    "profile_url": author_profile_url,
+                    # Note: profile_picture, headline, location, etc. require visiting the profile page
+                    # This is not done here to avoid triggering bot detection and slowing down scraping
+                    "profile_picture": None,
+                    "headline": None,
+                    "location": None,
+                    "current_position": None,
+                    "connection_count": None,
+                }
+                
+                # Only add if we have at least profile_url
+                if person_data["profile_url"]:
+                    people_dict[author_profile_url] = person_data
+        
+        if people_dict:
+            print(f"[INFO] Extracted {len(people_dict)} people from post authors. Enriching with full profile data...")
+            # Enrich with full profile data by visiting individual profiles
+            enriched_people = await self._enrich_people_profiles(list(people_dict.values()))
+            return enriched_people
+        
+        return list(people_dict.values())
+    
+    async def _enrich_people_profiles(self, people: List[Dict[str, Any]], max_profiles: int = 20) -> List[Dict[str, Any]]:
+        """Enrich people data by visiting their LinkedIn profile pages.
+        
+        Args:
+            people: List of people dicts with at least profile_url
+            max_profiles: Maximum number of profiles to enrich (to avoid too many requests)
+            
+        Returns:
+            List of enriched people dicts
+        """
+        if not people or not self.context:
+            return people
+        
+        enriched = []
+        # Limit to avoid too many requests
+        profiles_to_enrich = people[:max_profiles]
+        
+        print(f"[INFO] Enriching {len(profiles_to_enrich)} profile(s) with full data (headline, location, profile_picture, etc.)...")
+        
+        for i, person in enumerate(profiles_to_enrich):
+            profile_url = person.get("profile_url")
+            if not profile_url:
+                enriched.append(person)
+                continue
+            
+            try:
+                # Rate limiting: delay between requests (3-5 seconds)
+                if i > 0:
+                    delay = 3 + (i % 3)  # 3-5 seconds
+                    print(f"[INFO] Waiting {delay}s before next profile request (rate limiting)...")
+                    await asyncio.sleep(delay)
+                
+                page = await self.context.new_page()
+                
+                try:
+                    await page.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
+                    await page.wait_for_timeout(3000)  # Wait for content to load
+                    
+                    # Check for authwall or redirect
+                    current_url = page.url
+                    if "login" in current_url.lower() or "authwall" in current_url.lower():
+                        print(f"[WARNING] Cannot access profile {profile_url} - authentication required")
+                        enriched.append(person)  # Use basic data
+                        continue
+                    
+                    # Extract profile data using JavaScript
+                    profile_data = await page.evaluate("""
+                        () => {
+                            const data = {};
+                            
+                            // Extract headline - try more selectors
+                            const headlineSelectors = [
+                                '.text-body-medium.break-words',
+                                '.ph5.pb5 .text-body-medium.break-words',
+                                '[class*="top-card-layout__headline"]',
+                                '[data-generated-suggestion-target]',
+                                '.ph5 .text-body-medium',
+                                'h2[class*="headline"]',
+                                '.pv-text-details__left-panel h2',
+                                'div[class*="headline"]',
+                                'span[class*="text-body-medium"]',
+                                '.top-card-layout__headline'
+                            ];
+                            for (const selector of headlineSelectors) {
+                                try {
+                                    const elem = document.querySelector(selector);
+                                    if (elem) {
+                                        const text = elem.textContent ? elem.textContent.trim() : '';
+                                        if (text && text.length > 5 && text.length < 200 && !text.toLowerCase().includes('connections')) {
+                                            data.headline = text;
+                                            break;
+                                        }
+                                    }
+                                } catch(e) {
+                                    continue;
+                                }
+                            }
+                            
+                            // Extract location - try more selectors
+                            const locationSelectors = [
+                                '.text-body-small.inline.t-black--light.break-words',
+                                '.ph5 .text-body-small',
+                                '[class*="top-card-layout__first-subline"]',
+                                'span[class*="location"]',
+                                '.text-body-small[class*="location"]',
+                                '.top-card-layout__first-subline',
+                                'span[class*="text-body-small"]:not([class*="headline"])'
+                            ];
+                            for (const selector of locationSelectors) {
+                                try {
+                                    const elem = document.querySelector(selector);
+                                    if (elem) {
+                                        const text = elem.textContent ? elem.textContent.trim() : '';
+                                        if (text && text.length > 2 && text.length < 100 && 
+                                            !text.includes('connections') && 
+                                            !text.toLowerCase().includes('followers') &&
+                                            !text.match(/^\\d+$/)) {
+                                            // Likely a location if it contains common location words or commas
+                                            if (text.includes(',') || /^[A-Z][a-z]+/.test(text)) {
+                                                data.location = text;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                } catch(e) {
+                                    continue;
+                                }
+                            }
+                            
+                            // Extract profile picture - improved selectors
+                            const imgSelectors = [
+                                'img[class*="presence-entity__image"]',
+                                'img[class*="profile-photo"]',
+                                '.pv-top-card-profile-picture__image',
+                                'img[alt*="profile"]',
+                                '.top-card-profile-picture img',
+                                'img[src*="media.licdn.com/dms/image"][src*="/profile"]'
+                            ];
+                            for (const selector of imgSelectors) {
+                                try {
+                                    const img = document.querySelector(selector);
+                                    if (img && img.src) {
+                                        const src = img.src.split('?')[0];
+                                        if (src && !src.includes('logo') && !src.includes('ghost') && !src.includes('blank')) {
+                                            data.profile_picture = src;
+                                            break;
+                                        }
+                                    }
+                                } catch(e) {
+                                    continue;
+                                }
+                            }
+                            
+                            // Extract name (in case it wasn't in posts)
+                            if (!data.name) {
+                                const nameSelectors = [
+                                    'h1[class*="text-heading-xlarge"]',
+                                    '.text-heading-xlarge',
+                                    '.top-card-layout__title',
+                                    'h1',
+                                    '[class*="top-card-layout__title"]'
+                                ];
+                                for (const selector of nameSelectors) {
+                                    try {
+                                        const elem = document.querySelector(selector);
+                                        if (elem && elem.textContent) {
+                                            const text = elem.textContent.trim();
+                                            if (text.length > 2 && text.length < 100) {
+                                                data.name = text;
+                                                break;
+                                            }
+                                        }
+                                    } catch(e) {
+                                        continue;
+                                    }
+                                }
+                            }
+                            
+                            return data;
+                        }
+                    """)
+                    
+                    # Update person data with enriched fields (handle None case)
+                    if profile_data and isinstance(profile_data, dict):
+                        if profile_data.get("name"):
+                            person["name"] = profile_data["name"]
+                        if profile_data.get("headline"):
+                            person["headline"] = profile_data["headline"]
+                            person["current_position"] = profile_data["headline"]  # Use headline as position
+                        if profile_data.get("location"):
+                            person["location"] = profile_data["location"]
+                        if profile_data.get("profile_picture"):
+                            person["profile_picture"] = profile_data["profile_picture"]
+                    else:
+                        print(f"[DEBUG] Profile data extraction returned: {type(profile_data)}")
+                    
+                    print(f"[INFO] Enriched profile: {person.get('name', 'Unknown')} - {person.get('headline', 'N/A')[:50]}")
+                    
+                except asyncio.TimeoutError:
+                    print(f"[WARNING] Timeout accessing profile {profile_url}")
+                except Exception as e:
+                    print(f"[WARNING] Error enriching profile {profile_url}: {e}")
+                finally:
+                    await page.close()
+                
+                enriched.append(person)
+                
+            except Exception as e:
+                print(f"[WARNING] Error processing profile {profile_url}: {e}")
+                enriched.append(person)  # Use basic data if enrichment fails
+        
+        # Add remaining people without enrichment
+        enriched.extend(people[max_profiles:])
+        
+        print(f"[INFO] Successfully enriched {len(profiles_to_enrich)} profile(s)")
+        return enriched
     
     def _extract_comment_author(self, elem) -> Optional[str]:
         """Extract comment author."""
